@@ -147,8 +147,10 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 def _handle_dflash(server_args: ServerArgs) -> None:
     from sglang.srt.arg_groups.overrides import resolved_view
 
-    if not server_args.device.startswith("cuda"):
-        raise ValueError("DFLASH speculative decoding only supports CUDA device.")
+    if not (server_args.device.startswith("cuda") or server_args.device == "npu"):
+        raise ValueError(
+            "DFLASH speculative decoding only supports CUDA and NPU devices."
+        )
 
     if resolved_view(server_args).enable_dp_attention:
         raise ValueError(
@@ -436,11 +438,16 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     Consumed by ModelRunner's `is_draft_worker` override (one backend for all
     draft modes).
     """
-    from sglang.srt.utils import is_hip
+    from sglang.srt.utils import is_hip, is_npu
 
     supported_draft_backends = ("flashinfer", "fa3", "fa4", "triton", "ascend")
-    # Use triton on ROCm (no FlashInfer), flashinfer on CUDA.
-    fallback_backend = "triton" if is_hip() else "flashinfer"
+    # Use triton on ROCm (no FlashInfer), flashinfer on CUDA, ascend on NPU.
+    if is_npu():
+        fallback_backend = "ascend"
+    elif is_hip():
+        fallback_backend = "triton"
+    else:
+        fallback_backend = "flashinfer"
 
     draft_backend = server_args.speculative_draft_attention_backend
     if draft_backend is None:
