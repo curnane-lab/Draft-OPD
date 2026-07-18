@@ -1524,6 +1524,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         )
         if not success:
             return success, message
+        if getattr(recv_req, "draft_model_only", False):
+            return success, message
 
         success, message = (
             self.target_worker.model_runner.weight_updater.update_weights_from_tensor(

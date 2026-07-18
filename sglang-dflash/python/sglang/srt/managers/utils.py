@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
 
@@ -79,6 +79,11 @@ class GenerationBatchResult:
 
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
+
+    # OPD: per-request rejected draft suffix metadata produced by the verify
+    # worker (DFLASH always; EAGLE3 only for topk == 1 chains). Token-aligned
+    # per request; consumed by the batch result processor.
+    dflash_rejected_draft_metadata: Optional[Dict[str, List[List[Any]]]] = None
 
     # Refs the worker wants scheduler to keep alive for the same 2-iter window
     # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec

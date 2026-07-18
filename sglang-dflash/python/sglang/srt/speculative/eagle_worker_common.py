@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
+import torch.nn.functional as F
 
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_draft_cache_locs_contiguous,
@@ -561,6 +562,61 @@ def run_eagle_verify(
         accept_lens,
         accept_index,
     ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
+
+    # OPD: rejected draft suffix metadata for EAGLE3 chain verify (topk == 1).
+    # Rows whose drafts were all accepted stay empty; the batch result
+    # processor anchors the metadata at each verify commit's last token.
+    dflash_rejected_draft_metadata = None
+    if (
+        batch.spec_algorithm.is_eagle3()
+        and topk == 1
+        and not batch.forward_mode.is_idle()
+        and num_draft_tokens > 1
+    ):
+        candidates = verify_input.draft_token.reshape(bs, num_draft_tokens)
+        max_rejected_offset = num_draft_tokens - 1
+        accept_lens_cpu = accept_lens.cpu().tolist()
+        dflash_rejected_draft_metadata = {
+            "offsets": [[] for _ in range(bs)],
+            "token_ids": [[] for _ in range(bs)],
+            "teacher_logprobs": [[] for _ in range(bs)],
+        }
+        for row_idx in range(bs):
+            accepted_drafts = int(accept_lens_cpu[row_idx]) - 1
+            if accepted_drafts >= max_rejected_offset:
+                continue
+            start = max(0, accepted_drafts)
+            end = max_rejected_offset
+            rejected_token_tensor = candidates[row_idx, start:end]
+            if rejected_token_tensor.numel() == 0:
+                continue
+            row_base = row_idx * num_draft_tokens
+            row_indices = torch.arange(
+                row_base + start,
+                row_base + end,
+                dtype=torch.long,
+                device=logits_output.next_token_logits.device,
+            )
+            rejected_token_ids = rejected_token_tensor.to(
+                device=logits_output.next_token_logits.device, dtype=torch.long
+            )
+            rejected_log_probs = (
+                F.log_softmax(
+                    logits_output.next_token_logits[row_indices].float(), dim=-1
+                )
+                .gather(dim=-1, index=rejected_token_ids.unsqueeze(-1))
+                .squeeze(-1)
+            )
+            dflash_rejected_draft_metadata["offsets"][row_idx] = list(
+                range(start + 1, num_draft_tokens)
+            )
+            dflash_rejected_draft_metadata["token_ids"][row_idx] = [
+                int(token_id) for token_id in rejected_token_tensor.tolist()
+            ]
+            dflash_rejected_draft_metadata["teacher_logprobs"][row_idx] = [
+                float(logprob) for logprob in rejected_log_probs.detach().cpu().tolist()
+            ]
+
     new_seq_lens = batch.seq_lens + accept_lens
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),
@@ -630,6 +686,7 @@ def run_eagle_verify(
         next_draft_input=next_draft_input,
         accept_lens=accept_lens,
         new_seq_lens=new_seq_lens,
+        dflash_rejected_draft_metadata=dflash_rejected_draft_metadata,
         routed_experts_output=forward_batch_output.routed_experts_output,
         indexer_topk_output=forward_batch_output.indexer_topk_output,
         extra_keep_alive_refs=[verify_forward_batch],

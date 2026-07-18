@@ -585,6 +585,69 @@ def compute_dflash_correct_drafts_and_bonus(
     return correct_len, bonus.to(torch.int64)
 
 
+def compute_dflash_candidate_logprobs(
+    *,
+    candidates: torch.Tensor,
+    next_token_logits: torch.Tensor,
+    sampling_info: Any,
+    use_sampling_distribution: bool,
+) -> torch.Tensor:
+    """Return target logprobs for draft candidates at offsets 1..block_size-1."""
+    if candidates.ndim != 2:
+        raise ValueError(f"candidates must be 2D, got shape={tuple(candidates.shape)}")
+    if next_token_logits.ndim != 2:
+        raise ValueError(
+            "next_token_logits must be 2D, "
+            f"got shape={tuple(next_token_logits.shape)}."
+        )
+
+    bs, draft_token_num = candidates.shape
+    expected_rows = bs * draft_token_num
+    if next_token_logits.shape[0] != expected_rows:
+        raise ValueError(
+            "next_token_logits row count mismatch. "
+            f"Expected {expected_rows}, got {next_token_logits.shape[0]}."
+        )
+    if draft_token_num <= 1:
+        return next_token_logits.new_empty((bs, 0), dtype=torch.float32)
+
+    if use_sampling_distribution:
+        if sampling_info is None:
+            raise ValueError(
+                "sampling_info is required when use_sampling_distribution=True."
+            )
+        if top_k_renorm_prob is None or top_p_renorm_prob is None:
+            raise RuntimeError(
+                "DFLASH sampling logprob computation is unavailable on this build/device."
+            )
+        expanded_temperature = torch.repeat_interleave(
+            sampling_info.temperatures, draft_token_num, dim=0
+        )
+        probs = F.softmax(next_token_logits / expanded_temperature, dim=-1)
+        if bool(getattr(sampling_info, "need_top_k_sampling", True)):
+            probs = top_k_renorm_prob(
+                probs,
+                torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
+            )
+        if bool(getattr(sampling_info, "need_top_p_sampling", False)):
+            probs = top_p_renorm_prob(
+                probs,
+                torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
+            )
+        tiny = torch.finfo(probs.dtype).tiny
+        log_probs = torch.log(probs.clamp_min(tiny))
+    else:
+        log_probs = F.log_softmax(next_token_logits.float(), dim=-1)
+
+    log_probs = log_probs.view(bs, draft_token_num, -1)
+    candidate_token_ids = candidates[:, 1:].to(dtype=torch.long)
+    return (
+        log_probs[:, :-1, :]
+        .gather(dim=-1, index=candidate_token_ids.unsqueeze(-1))
+        .squeeze(-1)
+    )
+
+
 def compute_dflash_sampling_correct_drafts_and_bonus(
     *,
     candidates: torch.Tensor,

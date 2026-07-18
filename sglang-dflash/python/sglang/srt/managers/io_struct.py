@@ -1604,6 +1604,8 @@ class UpdateWeightsFromTensorReqInput(BaseReq, kw_only=True):
     weight_version: Optional[str] = None
     # Optional: Determine whether to disable updating the draft model
     disable_draft_model: Optional[bool] = None
+    # Optional: Update only the speculative draft worker, leaving target weights unchanged
+    draft_model_only: Optional[bool] = None
     # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
 

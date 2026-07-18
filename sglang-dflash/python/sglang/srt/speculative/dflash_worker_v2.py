@@ -30,6 +30,7 @@ from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     apply_dflash_verify_logits_adjustments,
     can_dflash_use_fused_qkv_proj,
+    compute_dflash_candidate_logprobs,
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
     is_dflash_sampling_verify_available,
@@ -466,6 +467,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         if name == "_target_worker":
             raise AttributeError(name)
         return getattr(self.target_worker, name)
+
+    def update_weights_from_tensor(self, recv_req):
+        # Scheduler routes draft-model tensor updates to the spec worker.
+        # DFlashWorkerV2 wraps both target and draft workers, so do not let
+        # __getattr__ forward these updates into the target worker.
+        return self.draft_worker.update_weights_from_tensor(recv_req)
 
     def clear_cache_pool(self):
         # The target worker owns the shared KV allocator/cache. For the compact
@@ -1553,11 +1560,12 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         candidates = draft_tokens
         new_seq_lens = None
-        if (
+        use_sampling_distribution = (
             sampling_info is not None
             and not sampling_info.is_all_greedy
             and is_dflash_sampling_verify_available()
-        ):
+        )
+        if use_sampling_distribution:
             accept_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
                 candidates=candidates,
                 next_token_logits=logits_output.next_token_logits,
@@ -1636,6 +1644,46 @@ class DFlashWorkerV2(BaseSpecWorker):
                     1, accept_len.to(torch.int64)[:, None], bonus[:, None]
                 )
 
+        # OPD: collect the rejected draft suffix (token ids + teacher logprobs)
+        # for every request whose block was not fully accepted. This runs after
+        # all accept paths (sampling / triton / eager) so accept_len and
+        # candidates are final.
+        candidate_teacher_logprobs = compute_dflash_candidate_logprobs(
+            candidates=candidates,
+            next_token_logits=logits_output.next_token_logits,
+            sampling_info=sampling_info,
+            use_sampling_distribution=use_sampling_distribution,
+        )
+        max_acc = int(self.block_size) - 1
+        suffix_metadata = {
+            "offsets": [[] for _ in range(bs)],
+            "token_ids": [[] for _ in range(bs)],
+            "teacher_logprobs": [[] for _ in range(bs)],
+        }
+        if max_acc > 0:
+            candidate_suffix_cpu = candidates[:, 1:].cpu()
+            teacher_suffix_cpu = candidate_teacher_logprobs.cpu()
+            accept_len_cpu = accept_len.cpu().tolist()
+            for row_idx, acc_len_item in enumerate(accept_len_cpu):
+                acc_len_item = int(acc_len_item)
+                if acc_len_item >= max_acc:
+                    continue
+                suffix_metadata["offsets"][row_idx] = list(
+                    range(acc_len_item + 1, int(self.block_size))
+                )
+                suffix_metadata["token_ids"][row_idx] = [
+                    int(token_id)
+                    for token_id in candidate_suffix_cpu[
+                        row_idx, acc_len_item:max_acc
+                    ].tolist()
+                ]
+                suffix_metadata["teacher_logprobs"][row_idx] = [
+                    float(logprob)
+                    for logprob in teacher_suffix_cpu[
+                        row_idx, acc_len_item:max_acc
+                    ].tolist()
+                ]
+
         if self._need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
             self._update_target_mamba_state_after_verify(
@@ -1680,6 +1728,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.block_size),
+            dflash_rejected_draft_metadata=suffix_metadata,
             # The non-overlap (sync) scheduler path advances batch.seq_lens
             # from the result; overlap carries it via next_draft_input instead.
             new_seq_lens=new_seq_lens,

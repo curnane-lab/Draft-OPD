@@ -51,6 +51,10 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
+from sglang.srt.managers.customized_info_utils import (
+    extend_customized_info_chunk,
+    update_customized_info_meta,
+)
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import (
@@ -233,9 +237,7 @@ class ReqState:
     output_top_logprobs: List[Any] = dataclasses.field(default_factory=list)
     input_token_ids_logprobs: List[Any] = dataclasses.field(default_factory=list)
     output_token_ids_logprobs: List[Any] = dataclasses.field(default_factory=list)
-    customized_info_accumulated: Dict[str, List[Any]] = dataclasses.field(
-        default_factory=dict
-    )
+    customized_info: Dict[str, List[Any]] = dataclasses.field(default_factory=dict)
 
     # For return_prompt_token_ids: stores prompt token IDs captured after tokenization
     prompt_token_ids: Optional[List[int]] = None
@@ -1520,7 +1522,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 out = self._coalesce_streaming_chunks(
                     out_list,
                     obj.rid,
-                    state.customized_info_accumulated.keys(),
+                    state.customized_info.keys(),
                 )
             else:
                 out = out_list[-1]
@@ -1985,11 +1987,27 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         i
                     ]
                 if customized_info is not None:
-                    for k, v in customized_info.items():
-                        if k not in state.customized_info_accumulated:
-                            state.customized_info_accumulated[k] = []
-                        state.customized_info_accumulated[k].extend(v[i])
-                        meta_info[k] = state.customized_info_accumulated[k]
+                    # Incremental streaming needs chunk-local deltas in
+                    # meta_info; all other paths emit the accumulated lists
+                    # (only the finish chunk is actually sent there).
+                    is_incremental_stream = (
+                        getattr(state.obj, "stream", False)
+                        and self.incremental_streaming_output
+                    )
+                    update_customized_info_meta(
+                        meta_info=meta_info,
+                        state=state,
+                        recv_customized_info=customized_info,
+                        recv_index=i,
+                        use_stream_output=is_incremental_stream,
+                    )
+                    if is_incremental_stream:
+                        # The emit above is chunk-local and does not touch
+                        # state; still accumulate so the streaming-chunk
+                        # coalescer knows the keys and late-arriving keys are
+                        # retained.
+                        for k, v in customized_info.items():
+                            extend_customized_info_chunk(state.customized_info, k, v[i])
 
                 # Add multimodal prompt token counts only for requests that
                 # actually consumed them, so plain-text meta_info stays unchanged.
@@ -2041,7 +2059,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         _slice_streaming_output_meta_info(
                             meta_info,
                             output_offset,
-                            state.customized_info_accumulated.keys(),
+                            # customized_info entries are already chunk-local
+                            # deltas (see update_customized_info_meta), so they
+                            # must not be offset-sliced again.
+                            customized_info_keys=None,
                         )
                         state.last_output_offset = len(state.output_ids)
                         out_dict = {
@@ -2087,7 +2108,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         _slice_streaming_output_meta_info(
                             meta_info,
                             output_offset,
-                            state.customized_info_accumulated.keys(),
+                            # customized_info entries are already chunk-local
+                            # deltas (see update_customized_info_meta), so they
+                            # must not be offset-sliced again.
+                            customized_info_keys=None,
                         )
                         state.last_output_offset = len(state.output_ids)
                         out_dict = {

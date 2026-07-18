@@ -16,6 +16,10 @@ import torch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.customized_info_utils import (
+    append_dflash_reject_token_mask,
+    append_dflash_rejected_draft_metadata,
+)
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_MATCHED_TOKEN,
@@ -600,6 +604,28 @@ class SchedulerBatchResultProcessor:
                 if cap_lens is not None:
                     req.spec_num_cap_tokens += cap_lens[i]
                     req.update_spec_cap_lens_histogram(cap_lens[i])
+
+                # OPD: anchor the reject point of this verify commit and attach
+                # the rejected draft suffix metadata (DFLASH always; EAGLE3
+                # produces it for topk == 1 chains). output_ids are extended
+                # later in process_batch_result_decode.
+                if batch.spec_algorithm.is_dflash() or batch.spec_algorithm.is_eagle3():
+                    append_dflash_reject_token_mask(
+                        req,
+                        num_accept_tokens,
+                        output_ids_already_updated=False,
+                    )
+                    rejected_metadata = result.dflash_rejected_draft_metadata
+                    if rejected_metadata is not None:
+                        append_dflash_rejected_draft_metadata(
+                            req,
+                            num_accept_tokens,
+                            anchor_index=len(req.output_ids) - 1,
+                            offsets=rejected_metadata["offsets"][i],
+                            token_ids=rejected_metadata["token_ids"][i],
+                            teacher_logprobs=rejected_metadata["teacher_logprobs"][i],
+                            output_ids_already_updated=False,
+                        )
 
             predict_tokens.append(accept_tokens)
 
