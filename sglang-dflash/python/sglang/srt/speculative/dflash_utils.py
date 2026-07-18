@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from numbers import Integral
 from typing import Any, List, Optional, Tuple
@@ -7,12 +9,14 @@ from typing import Any, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
-from sglang.srt.utils import is_cuda
+from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.utils import is_cuda, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
+
+logger = logging.getLogger(__name__)
 
 _DFLASH_SAMPLING_VERIFY_AVAILABLE = False
 _DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[Optional[int], int], dict[str, Any]] = {}
@@ -21,13 +25,14 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
         "FlashInferAttnBackend",
         "FlashInferMLAAttnBackend",
         "FlashAttentionBackend",
+        "TritonAttnBackend",
         "TRTLLMHAAttnBackend",
         "TRTLLMMLABackend",
     }
 )
 
 
-if is_cuda():
+if is_cuda() or is_musa():
     try:
         from sgl_kernel import (
             top_k_renorm_prob,
@@ -89,146 +94,6 @@ def scale_kv_cell_size_per_token_for_dflash(
     return (
         int(target_cell_size_per_token) * int(total_layers) + int(target_num_layers) - 1
     ) // int(target_num_layers)
-
-
-@dataclass(frozen=True)
-class DFlashAutoMemoryPlan:
-    max_mamba_cache_size: int
-    min_required_tokens: int
-    required_rest_memory_gb: float
-
-
-def resolve_dflash_concurrency_required_tokens(
-    *,
-    max_running_requests: int,
-    page_size: int,
-    speculative_num_draft_tokens: int,
-) -> int:
-    if max_running_requests <= 0:
-        raise ValueError(
-            f"max_running_requests must be positive, got {max_running_requests}."
-        )
-    if page_size <= 0:
-        raise ValueError(f"page_size must be positive, got {page_size}.")
-    if speculative_num_draft_tokens < 0:
-        raise ValueError(
-            "speculative_num_draft_tokens must be non-negative, "
-            f"got {speculative_num_draft_tokens}."
-        )
-
-    estimated_max_decode_tokens_per_req = int(
-        envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
-    )
-    per_request_tokens = (
-        int(page_size)
-        + int(page_size)
-        + max(
-            int(estimated_max_decode_tokens_per_req),
-            2 * int(speculative_num_draft_tokens),
-        )
-    )
-    return int(max_running_requests) * per_request_tokens
-
-
-def resolve_dflash_max_mamba_cache_size(
-    *,
-    max_running_requests: int,
-    mamba_ratio: int,
-    explicit_max_mamba_cache_size: Optional[int] = None,
-) -> int:
-    if max_running_requests <= 0:
-        raise ValueError(
-            f"max_running_requests must be positive, got {max_running_requests}."
-        )
-    if mamba_ratio <= 0:
-        raise ValueError(f"mamba_ratio must be positive, got {mamba_ratio}.")
-    if explicit_max_mamba_cache_size is not None:
-        explicit_max_mamba_cache_size = int(explicit_max_mamba_cache_size)
-        if explicit_max_mamba_cache_size <= 0:
-            raise ValueError(
-                "explicit_max_mamba_cache_size must be positive when provided, "
-                f"got {explicit_max_mamba_cache_size}."
-            )
-        return explicit_max_mamba_cache_size
-    return int(max_running_requests) * int(mamba_ratio)
-
-
-def resolve_dflash_auto_memory_plan(
-    *,
-    rest_memory_gb: float,
-    post_model_load_memory_gb: float,
-    cell_size: int,
-    max_running_requests: int,
-    mamba_cache_per_req: int,
-    speculative_num_draft_tokens: int,
-    chunked_prefill_size: Optional[int],
-    max_prefill_tokens: int,
-    page_size: int,
-    mamba_ratio: int,
-    explicit_max_mamba_cache_size: Optional[int] = None,
-) -> DFlashAutoMemoryPlan:
-    if cell_size <= 0:
-        raise ValueError(f"cell_size must be positive, got {cell_size}.")
-    if mamba_cache_per_req <= 0:
-        raise ValueError(
-            f"mamba_cache_per_req must be positive, got {mamba_cache_per_req}."
-        )
-    if speculative_num_draft_tokens < 0:
-        raise ValueError(
-            "speculative_num_draft_tokens must be non-negative, "
-            f"got {speculative_num_draft_tokens}."
-        )
-    if max_prefill_tokens <= 0:
-        raise ValueError(
-            f"max_prefill_tokens must be positive, got {max_prefill_tokens}."
-        )
-    if page_size <= 0:
-        raise ValueError(f"page_size must be positive, got {page_size}.")
-
-    max_mamba_cache_size = resolve_dflash_max_mamba_cache_size(
-        max_running_requests=max_running_requests,
-        mamba_ratio=mamba_ratio,
-        explicit_max_mamba_cache_size=explicit_max_mamba_cache_size,
-    )
-
-    if chunked_prefill_size is not None and int(chunked_prefill_size) > 0:
-        min_required_tokens = int(chunked_prefill_size)
-    else:
-        min_required_tokens = int(max_prefill_tokens)
-    min_required_tokens = max(min_required_tokens, int(page_size))
-    min_required_tokens = max(
-        min_required_tokens,
-        resolve_dflash_concurrency_required_tokens(
-            max_running_requests=max_running_requests,
-            page_size=page_size,
-            speculative_num_draft_tokens=speculative_num_draft_tokens,
-        ),
-    )
-
-    linear_state_bytes = int(mamba_cache_per_req) * (
-        int(max_mamba_cache_size)
-        + int(max_running_requests) * int(speculative_num_draft_tokens)
-    )
-    required_rest_memory_gb = (
-        linear_state_bytes + int(min_required_tokens) * int(cell_size)
-    ) / float(1 << 30)
-    if required_rest_memory_gb > float(post_model_load_memory_gb):
-        raise RuntimeError(
-            "Not enough GPU memory for DFLASH auto sizing. "
-            f"Required at least {required_rest_memory_gb:.2f} GB after weight load, "
-            f"but only {float(post_model_load_memory_gb):.2f} GB is available. "
-            f"max_running_requests={max_running_requests}, "
-            f"max_mamba_cache_size={max_mamba_cache_size}, "
-            f"min_required_tokens={min_required_tokens}."
-        )
-
-    return DFlashAutoMemoryPlan(
-        max_mamba_cache_size=int(max_mamba_cache_size),
-        min_required_tokens=int(min_required_tokens),
-        required_rest_memory_gb=max(
-            float(rest_memory_gb), float(required_rest_memory_gb)
-        ),
-    )
 
 
 def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
@@ -428,6 +293,36 @@ def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> Lis
         int(round(start + (i * span) / (num_draft_layers - 1)))
         for i in range(num_draft_layers)
     ]
+
+
+def get_dflash_layer_types(config: Any) -> Optional[Sequence[str]]:
+    text_config = _get_text_config(config)
+    layer_types = _cfg_get(text_config, "layer_types", _cfg_get(config, "layer_types"))
+    if layer_types is None:
+        return None
+    if isinstance(layer_types, str) or not isinstance(layer_types, Sequence):
+        raise ValueError(
+            "DFLASH config.layer_types must be a sequence of attention type strings."
+        )
+    return layer_types
+
+
+def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
+    layer_types = get_dflash_layer_types(config)
+    if layer_types is None or "sliding_attention" not in layer_types:
+        return None
+
+    text_config = _get_text_config(config)
+    sliding_window = _cfg_get(
+        text_config, "sliding_window", _cfg_get(config, "sliding_window")
+    )
+    if sliding_window is None:
+        raise ValueError(
+            "DFLASH sliding_attention layers require config.sliding_window."
+        )
+
+    # HF sliding windows include the current token; SGLang stores window_left.
+    return int(sliding_window) - 1
 
 
 def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
@@ -649,7 +544,7 @@ def can_dflash_use_fused_qkv_proj(qkv_proj: Any) -> Tuple[bool, str]:
     return True, ""
 
 
-def compute_dflash_accept_len_and_bonus(
+def compute_dflash_correct_drafts_and_bonus(
     *,
     candidates: torch.Tensor,
     target_predict: torch.Tensor,
@@ -663,8 +558,8 @@ def compute_dflash_accept_len_and_bonus(
             Shape: [bs, block_size]. target_predict[:, t] corresponds to argmax at position t.
 
     Returns:
-        accept_len: int32 tensor [bs], number of accepted *draft* tokens (excluding current token and bonus token).
-        bonus: int64 tensor [bs], the target-predicted token at index accept_len (the "bonus" token to append).
+        correct_len: int32 tensor [bs], number of accepted *draft* tokens (excluding current token and bonus token).
+        bonus: int64 tensor [bs], the target-predicted token at index correct_len (the "bonus" token to append).
 
     Notes:
         Matches the reference implementation rule:
@@ -685,71 +580,12 @@ def compute_dflash_accept_len_and_bonus(
         raise ValueError(f"block_size must be positive, got {block_size}.")
 
     matches = candidates[:, 1:] == target_predict[:, :-1]
-    accept_len = matches.to(torch.int32).cumprod(dim=1).sum(dim=1)
-    bonus = target_predict[torch.arange(bs, device=target_predict.device), accept_len]
-    return accept_len, bonus.to(torch.int64)
+    correct_len = matches.to(torch.int32).cumprod(dim=1).sum(dim=1)
+    bonus = target_predict[torch.arange(bs, device=target_predict.device), correct_len]
+    return correct_len, bonus.to(torch.int64)
 
 
-def compute_dflash_candidate_logprobs(
-    *,
-    candidates: torch.Tensor,
-    next_token_logits: torch.Tensor,
-    sampling_info: Any,
-    use_sampling_distribution: bool,
-) -> torch.Tensor:
-    """Return target logprobs for draft candidates at offsets 1..block_size-1."""
-    if candidates.ndim != 2:
-        raise ValueError(f"candidates must be 2D, got shape={tuple(candidates.shape)}")
-    if next_token_logits.ndim != 2:
-        raise ValueError(
-            "next_token_logits must be 2D, "
-            f"got shape={tuple(next_token_logits.shape)}."
-        )
-
-    bs, draft_token_num = candidates.shape
-    expected_rows = bs * draft_token_num
-    if next_token_logits.shape[0] != expected_rows:
-        raise ValueError(
-            "next_token_logits row count mismatch. "
-            f"Expected {expected_rows}, got {next_token_logits.shape[0]}."
-        )
-    if draft_token_num <= 1:
-        return next_token_logits.new_empty((bs, 0), dtype=torch.float32)
-
-    if use_sampling_distribution:
-        if sampling_info is None:
-            raise ValueError("sampling_info is required when use_sampling_distribution=True.")
-        if top_k_renorm_prob is None or top_p_renorm_prob is None:
-            raise RuntimeError("DFLASH sampling logprob computation is unavailable on this build/device.")
-        expanded_temperature = torch.repeat_interleave(
-            sampling_info.temperatures, draft_token_num, dim=0
-        )
-        probs = F.softmax(next_token_logits / expanded_temperature, dim=-1)
-        if bool(getattr(sampling_info, "need_top_k_sampling", True)):
-            probs = top_k_renorm_prob(
-                probs,
-                torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
-            )
-        if bool(getattr(sampling_info, "need_top_p_sampling", False)):
-            probs = top_p_renorm_prob(
-                probs,
-                torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
-            )
-        tiny = torch.finfo(probs.dtype).tiny
-        log_probs = torch.log(probs.clamp_min(tiny))
-    else:
-        log_probs = F.log_softmax(next_token_logits.float(), dim=-1)
-
-    log_probs = log_probs.view(bs, draft_token_num, -1)
-    candidate_token_ids = candidates[:, 1:].to(dtype=torch.long)
-    return (
-        log_probs[:, :-1, :]
-        .gather(dim=-1, index=candidate_token_ids.unsqueeze(-1))
-        .squeeze(-1)
-    )
-
-
-def compute_dflash_sampling_accept_len_and_bonus(
+def compute_dflash_sampling_correct_drafts_and_bonus(
     *,
     candidates: torch.Tensor,
     next_token_logits: torch.Tensor,
@@ -798,13 +634,13 @@ def compute_dflash_sampling_accept_len_and_bonus(
         )
 
     if threshold_single is None:
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_server_args
 
-        threshold_single = get_global_server_args().speculative_accept_threshold_single
+        threshold_single = get_server_args().speculative_accept_threshold_single
     if threshold_acc is None:
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_server_args
 
-        threshold_acc = get_global_server_args().speculative_accept_threshold_acc
+        threshold_acc = get_server_args().speculative_accept_threshold_acc
     threshold_single = float(threshold_single)
     threshold_acc = max(float(threshold_acc), 1e-9)
 
@@ -837,9 +673,69 @@ def compute_dflash_sampling_accept_len_and_bonus(
             dtype=torch.float32,
         )
 
+    target_probs = build_dflash_verify_target_probs(
+        next_token_logits=next_token_logits,
+        sampling_info=sampling_info,
+        draft_token_num=draft_token_num,
+        bs=bs,
+        max_top_k=max_top_k,
+        uniform_top_k_value=uniform_top_k_value,
+        use_sparse_topk=use_sparse_topk,
+    )
+    draft_probs = torch.zeros_like(target_probs)
+
+    (
+        retrieve_index,
+        retrieve_next_token,
+        retrieve_next_sibling,
+        predicts,
+        accept_index,
+        accept_token_num,
+    ) = _get_or_create_chain_verify_buffers(
+        bs=bs,
+        draft_token_num=draft_token_num,
+        device=device,
+    )
+    candidates_i64 = (
+        candidates if candidates.dtype == torch.int64 else candidates.to(torch.int64)
+    )
+    tree_speculative_sampling_target_only(
+        predicts=predicts,
+        accept_index=accept_index,
+        accept_token_num=accept_token_num,
+        candidates=candidates_i64,
+        retrive_index=retrieve_index,
+        retrive_next_token=retrieve_next_token,
+        retrive_next_sibling=retrieve_next_sibling,
+        uniform_samples=uniform_samples,
+        uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
+        target_probs=target_probs,
+        draft_probs=draft_probs,
+        threshold_single=threshold_single,
+        threshold_acc=threshold_acc,
+        deterministic=True,
+    )
+
+    correct_len = accept_token_num
+    row_ids = torch.arange(bs, dtype=torch.long, device=device)
+    accept_pos = accept_index[row_ids, correct_len.to(torch.long)].to(torch.long)
+    bonus = predicts[accept_pos].to(torch.int64)
+    return correct_len, bonus
+
+
+def build_dflash_verify_target_probs(
+    *,
+    next_token_logits: torch.Tensor,
+    sampling_info: Any,
+    draft_token_num: int,
+    bs: int,
+    max_top_k: Optional[int] = None,
+    uniform_top_k_value: Optional[int] = None,
+    use_sparse_topk: bool = True,
+) -> torch.Tensor:
+    device = next_token_logits.device
     need_top_k = bool(getattr(sampling_info, "need_top_k_sampling", True))
     need_top_p = bool(getattr(sampling_info, "need_top_p_sampling", False))
-    # Build target distribution once over all verify rows.
     expanded_temperature = torch.repeat_interleave(
         sampling_info.temperatures, draft_token_num, dim=0
     )
@@ -894,43 +790,25 @@ def compute_dflash_sampling_accept_len_and_bonus(
                 target_probs,
                 torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
             )
-    target_probs = target_probs.view(bs, draft_token_num, -1).contiguous()
-    draft_probs = torch.zeros_like(target_probs)
+    return target_probs.view(bs, draft_token_num, -1).contiguous()
 
-    (
-        retrieve_index,
-        retrieve_next_token,
-        retrieve_next_sibling,
-        predicts,
-        accept_index,
-        accept_token_num,
-    ) = _get_or_create_chain_verify_buffers(
-        bs=bs,
-        draft_token_num=draft_token_num,
-        device=device,
-    )
-    candidates_i64 = (
-        candidates if candidates.dtype == torch.int64 else candidates.to(torch.int64)
-    )
-    tree_speculative_sampling_target_only(
-        predicts=predicts,
-        accept_index=accept_index,
-        accept_token_num=accept_token_num,
-        candidates=candidates_i64,
-        retrive_index=retrieve_index,
-        retrive_next_token=retrieve_next_token,
-        retrive_next_sibling=retrieve_next_sibling,
-        uniform_samples=uniform_samples,
-        uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
-        target_probs=target_probs,
-        draft_probs=draft_probs,
-        threshold_single=threshold_single,
-        threshold_acc=threshold_acc,
-        deterministic=True,
-    )
 
-    accept_len = accept_token_num
-    row_ids = torch.arange(bs, dtype=torch.long, device=device)
-    accept_pos = accept_index[row_ids, accept_len.to(torch.long)].to(torch.long)
-    bonus = predicts[accept_pos].to(torch.int64)
-    return accept_len, bonus
+def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
+    if req.return_logprob:
+        return "DFLASH speculative decoding does not support return_logprob yet."
+
+    if enable_overlap and req.return_hidden_states:
+        return "DFLASH speculative decoding does not support return_hidden_states yet."
+
+    if (
+        req.sampling_params.json_schema is not None
+        or req.sampling_params.regex is not None
+        or req.sampling_params.ebnf is not None
+        or req.sampling_params.structural_tag is not None
+    ):
+        return (
+            "DFLASH speculative decoding does not support "
+            "grammar-constrained decoding yet."
+        )
+
+    return None
