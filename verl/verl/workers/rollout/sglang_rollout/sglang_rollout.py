@@ -37,6 +37,7 @@ from sglang.srt.weight_sync.utils import _preprocess_tensor_for_update_weights
 from sglang.srt.weight_sync.utils import update_weights as sgl_update_weights
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
+from verl.utils.device import is_torch_npu_available
 from verl.utils.net_utils import is_valid_ipv6_address
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
@@ -123,11 +124,13 @@ async def _update_weights_with_optional_draft_flag(
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-    os.environ["NCCL_CUMEM_ENABLE"] = "0"
-    os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
-    os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
-    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
-    os.environ["CUDA_MODULE_LOADING"] = "AUTO"
+    if not is_torch_npu_available():
+        # NCCL/CUDA settings are meaningless (and conflict with HCCL) on Ascend NPU.
+        os.environ["NCCL_CUMEM_ENABLE"] = "0"
+        os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
+        os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
+        os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
+        os.environ["CUDA_MODULE_LOADING"] = "AUTO"
     # Enable faulthandler in subprocesses
     os.environ["PYTHONFAULTHANDLER"] = "1"
 

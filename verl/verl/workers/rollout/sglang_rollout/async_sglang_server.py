@@ -43,7 +43,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.tokenizer_manager import ServerStatus
 
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.device import get_visible_devices_keyword
+from verl.utils.device import get_visible_devices_keyword, is_torch_npu_available
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.utils.profiler import DistProfiler, build_sglang_profiler_args
 from verl.workers.config import HFModelConfig, RolloutConfig
@@ -251,6 +251,10 @@ class SGLangHttpServer:
             else:
                 raise ValueError(f"Currently only support fp8 quantization, got: {quantization}")
         infer_tp = self.config.tensor_model_parallel_size * self.config.data_parallel_size
+        # Ascend NPU only supports the ascend attention backends; fa3 is CUDA-only.
+        on_npu = is_torch_npu_available()
+        default_attention_backend = "ascend" if on_npu else "fa3"
+        default_mm_attention_backend = "ascend_attn" if on_npu else "fa3"
         args = {
             "model_path": self.model_config.local_path,
             "dtype": self.config.dtype,
@@ -268,8 +272,8 @@ class SGLangHttpServer:
             "trust_remote_code": self.model_config.trust_remote_code,
             "max_running_requests": self.config.get("max_num_seqs", None),
             "log_level": "error",
-            "mm_attention_backend": "fa3",
-            "attention_backend": attention_backend if attention_backend is not None else "fa3",
+            "mm_attention_backend": default_mm_attention_backend,
+            "attention_backend": attention_backend if attention_backend is not None else default_attention_backend,
             "skip_tokenizer_init": self.config.skip_tokenizer_init,
             "skip_server_warmup": True,
             "quantization": quantization,

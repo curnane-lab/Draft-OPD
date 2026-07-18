@@ -29,6 +29,9 @@ cd "$REPO_ROOT"
 # source /path/to/miniconda3/bin/activate verl
 ROLLOUT_NAME="sglang" # sglang or vllm
 
+# Attention backend for the sglang rollout engine: fa3 on CUDA, ascend on NPU.
+ATTENTION_BACKEND=${ATTENTION_BACKEND:-$(python -c "import torch; print('ascend' if hasattr(torch, 'npu') and torch.npu.is_available() else 'fa3')" 2>/dev/null || echo fa3)}
+
 MAIN_MODEL_PATH=${MAIN_MODEL_PATH:-""} # your model path.
 
 DRAFT_MODEL_PATH=${DRAFT_MODEL_PATH:-""} # your draft model path.
@@ -224,7 +227,7 @@ ROLLOUT=(
     +actor_rollout_ref.rollout.engine_kwargs.sglang.speculative_draft_model_path="$DRAFT_MODEL_PATH"
     +actor_rollout_ref.rollout.engine_kwargs.sglang.tp_size=1
     +actor_rollout_ref.rollout.engine_kwargs.sglang.dtype=bfloat16
-    +actor_rollout_ref.rollout.engine_kwargs.sglang.attention_backend=fa3
+    +actor_rollout_ref.rollout.engine_kwargs.sglang.attention_backend=$ATTENTION_BACKEND
     +actor_rollout_ref.rollout.engine_kwargs.sglang.mem_fraction_static=0.4
     +actor_rollout_ref.rollout.engine_kwargs.sglang.trust_remote_code=True
     +actor_rollout_ref.rollout.engine_kwargs.sglang.random_seed=$SEED
