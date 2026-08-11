@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 import torch
+import torch.nn.functional as F
 from tensordict import TensorDict
 
 from verl.base_config import BaseConfig
@@ -191,6 +192,7 @@ def compute_opd_distillation_metrics(
         "opd_sample_count": "distillation/opd_sample_count",
         "opd_target_token_count": "distillation/opd_target_token_count",
         "opd_rejected_draft_token_count": "distillation/opd_rejected_draft_token_count",
+        "opd_dspark_confidence_token_count": "distillation/dspark_confidence_token_count",
     }
     for source_key, metric_key in sum_metric_keys.items():
         value = model_output.get(source_key)
@@ -199,6 +201,7 @@ def compute_opd_distillation_metrics(
 
     mean_metric_keys = {
         "opd_attention_impl_id": "distillation/opd_attention_impl_id",
+        "opd_draft_variant_id": "distillation/opd_draft_variant_id",
         "opd_profile_teacher_forward_ms": "distillation/opd_profile_teacher_forward_ms",
         "opd_profile_draft_forward_ms": "distillation/opd_profile_draft_forward_ms",
         "opd_profile_lm_head_ms": "distillation/opd_profile_lm_head_ms",
@@ -214,6 +217,21 @@ def compute_opd_distillation_metrics(
         else:
             metric_value = effective_token_count.new_tensor(float(value), dtype=torch.float32)
         metrics[metric_key] = Metric(AggregationType.MEAN, metric_value)
+    confidence_stream = get_dspark_confidence_stream(model_output)
+    if confidence_stream is not None:
+        confidence_logits, confidence_labels, confidence_mask = confidence_stream
+        confidence_bce = F.binary_cross_entropy_with_logits(
+            confidence_logits.float(), confidence_labels.float(), reduction="none"
+        )
+        metrics["distillation/dspark_confidence_bce_loss"] = Metric(
+            AggregationType.MEAN, _valid_mean(confidence_bce, confidence_mask)
+        )
+        metrics["distillation/dspark_accept_label_mean"] = Metric(
+            AggregationType.MEAN, _valid_mean(confidence_labels.float(), confidence_mask)
+        )
+        metrics["distillation/dspark_confidence_pred_mean"] = Metric(
+            AggregationType.MEAN, _valid_mean(confidence_logits.detach().float().sigmoid(), confidence_mask)
+        )
     eagle3_total = model_output.get("eagle3_target_argmax_total_count")
     eagle3_supported = model_output.get("eagle3_target_argmax_supported_count")
     eagle3_top1 = model_output.get("eagle3_draft_target_top1_correct_count")
@@ -258,6 +276,39 @@ def get_rejected_draft_distillation_stream(
     if not bool(mask.any()):
         return None
     return student_log_probs, teacher_log_probs, mask
+
+
+def get_dspark_confidence_stream(
+    model_output: dict,
+) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Decode the DSpark confidence calibration stream from the composed student.
+
+    Returns (raw_confidence_logits, 0/1 accept_labels, mask), each flattened from
+    (batch, rejected_width, block_size), or None when the stream is absent or empty.
+    """
+    mask = model_output.get("opd_dspark_confidence_mask")
+    if mask is None:
+        return None
+
+    logits = model_output.get("opd_dspark_confidence_logits")
+    labels = model_output.get("opd_dspark_confidence_labels")
+    if logits is None or labels is None:
+        raise RuntimeError(
+            "DSpark confidence loss mask is present, but confidence logits or labels are missing."
+        )
+
+    mask = _flatten_nested_tensor(mask).bool()
+    logits = _flatten_nested_tensor(logits)
+    labels = _flatten_nested_tensor(labels)
+    if logits.shape != labels.shape or logits.shape != mask.shape:
+        raise ValueError(
+            "DSpark confidence stream shape mismatch: "
+            f"logits={tuple(logits.shape)}, labels={tuple(labels.shape)}, "
+            f"mask={tuple(mask.shape)}."
+        )
+    if not bool(mask.any()):
+        return None
+    return logits, labels, mask
 
 
 def compute_topk_loss(
@@ -661,11 +712,30 @@ def distillation_loss(
             AggregationType.MEAN, rejected_valid_losses.mean()
         )
 
+    confidence_term = None
+    confidence_stream = get_dspark_confidence_stream(model_output)
+    if confidence_stream is not None:
+        tv_mix = float(getattr(loss_config, "confidence_tv_target_mix", 0.0) or 0.0)
+        if tv_mix > 0.0:
+            raise NotImplementedError(
+                "confidence_tv_target_mix > 0 (TV soft targets) is not supported by the OPD replay path; "
+                "keep it at 0.0 to calibrate on the true 0/1 acceptance labels."
+            )
+        confidence_weight = _loss_weight(loss_config, "confidence_loss_weight", 1.0)
+        if confidence_weight > 0:
+            confidence_logits, confidence_labels, confidence_mask = confidence_stream
+            confidence_bce = F.binary_cross_entropy_with_logits(
+                confidence_logits.float(), confidence_labels.float(), reduction="none"
+            )
+            confidence_term = confidence_weight * _valid_mean(confidence_bce, confidence_mask)
+
     if not bool(effective_response_mask.any()) and rejected_draft_losses is None:
         if "log_probs" in model_output:
             zero_loss = no_padding_2_padding(model_output["log_probs"], data).sum() * 0.0
         else:
             zero_loss = distillation_losses.sum() * 0.0
+        if confidence_term is not None:
+            zero_loss = zero_loss + confidence_term
         return zero_loss, distillation_metrics
 
     if loss_config.use_policy_gradient:
@@ -736,6 +806,9 @@ def distillation_loss(
             distillation_metrics["distillation/combined_token_count"] = Metric(
                 AggregationType.SUM, response_count.detach() + rejected_count.detach()
             )
+
+    if confidence_term is not None:
+        distillation_loss = distillation_loss + confidence_term
 
     return distillation_loss, distillation_metrics
 

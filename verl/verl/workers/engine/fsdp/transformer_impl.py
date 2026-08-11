@@ -1577,6 +1577,9 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 dflash_rejected_draft_teacher_log_probs = output.get("dflash_rejected_draft_teacher_log_probs")
                 dflash_rejected_draft_loss_mask = output.get("dflash_rejected_draft_loss_mask")
                 dflash_rejected_draft_offsets = output.get("dflash_rejected_draft_offsets")
+                dflash_dspark_confidence_logits = output.get("dflash_dspark_confidence_logits")
+                dflash_dspark_confidence_labels = output.get("dflash_dspark_confidence_labels")
+                dflash_dspark_confidence_mask = output.get("dflash_dspark_confidence_mask")
                 eagle3_native_ce_losses = output.get("eagle3_native_ce_losses")
                 eagle3_selected_scalar_loss_mask = output.get("eagle3_selected_scalar_loss_mask")
             else:
@@ -1591,6 +1594,9 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 )
                 dflash_rejected_draft_loss_mask = getattr(output, "dflash_rejected_draft_loss_mask", None)
                 dflash_rejected_draft_offsets = getattr(output, "dflash_rejected_draft_offsets", None)
+                dflash_dspark_confidence_logits = getattr(output, "dflash_dspark_confidence_logits", None)
+                dflash_dspark_confidence_labels = getattr(output, "dflash_dspark_confidence_labels", None)
+                dflash_dspark_confidence_mask = getattr(output, "dflash_dspark_confidence_mask", None)
                 eagle3_native_ce_losses = getattr(output, "eagle3_native_ce_losses", None)
                 eagle3_selected_scalar_loss_mask = getattr(output, "eagle3_selected_scalar_loss_mask", None)
 
@@ -1632,6 +1638,12 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 model_output["opd_rejected_draft_loss_mask"] = dflash_rejected_draft_loss_mask
             if dflash_rejected_draft_offsets is not None:
                 model_output["opd_rejected_draft_offsets"] = dflash_rejected_draft_offsets
+            if dflash_dspark_confidence_logits is not None:
+                model_output["opd_dspark_confidence_logits"] = dflash_dspark_confidence_logits
+            if dflash_dspark_confidence_labels is not None:
+                model_output["opd_dspark_confidence_labels"] = dflash_dspark_confidence_labels
+            if dflash_dspark_confidence_mask is not None:
+                model_output["opd_dspark_confidence_mask"] = dflash_dspark_confidence_mask
             for source_key, output_key in (
                 ("dflash_opd_valid_anchor_count", "opd_valid_anchor_count"),
                 ("dflash_opd_skipped_sample_count", "opd_skipped_sample_count"),
@@ -1641,6 +1653,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 ("dflash_opd_target_token_count", "opd_target_token_count"),
                 ("dflash_opd_rejected_draft_token_count", "opd_rejected_draft_token_count"),
                 ("dflash_opd_attention_impl_id", "opd_attention_impl_id"),
+                ("dflash_opd_draft_variant_id", "opd_draft_variant_id"),
+                ("dflash_opd_dspark_confidence_token_count", "opd_dspark_confidence_token_count"),
                 ("dflash_opd_profile_teacher_forward_ms", "opd_profile_teacher_forward_ms"),
                 ("dflash_opd_profile_draft_forward_ms", "opd_profile_draft_forward_ms"),
                 ("dflash_opd_profile_lm_head_ms", "opd_profile_lm_head_ms"),

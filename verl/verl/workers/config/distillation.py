@@ -55,6 +55,14 @@ class DistillationLossConfig(BaseConfig):
     rejected_draft_position_decay (float):
         Per-draft-offset decay for rejected draft token loss weights. The first drafted token uses weight 1.0,
         the second uses this value, the third uses this value squared, and so on.
+    confidence_loss_weight (float):
+        Weight for the DSpark confidence-head BCE calibration loss on true 0/1 acceptance labels.
+        Only consumed when the composed student runs the DSpark draft variant and emits the
+        confidence stream; ignored otherwise.
+    confidence_tv_target_mix (float):
+        Reserved mix ratio for blending TV-based soft targets into the confidence BCE labels.
+        Must be 0.0 (pure true 0/1 acceptance labels); soft-target mixing is not implemented
+        in the OPD replay path.
     loss_max_clamp (float, optional):
         Maximum value to clamp distillation loss. If None, no clamping is applied.
     log_prob_min_clamp (float, optional):
@@ -88,6 +96,8 @@ class DistillationLossConfig(BaseConfig):
     rejected_draft_use_reverse_kl: bool = False
     rejected_draft_position_decay_enabled: bool = True
     rejected_draft_position_decay: float = 0.9
+    confidence_loss_weight: float = 1.0
+    confidence_tv_target_mix: float = 0.0
     loss_max_clamp: Optional[float] = 10.0
     log_prob_min_clamp: Optional[float] = -10.0
 
@@ -117,6 +127,12 @@ class DistillationLossConfig(BaseConfig):
             raise ValueError(f"reverse_kl_weight must be non-negative, got {self.reverse_kl_weight}.")
         if self.forward_kl_weight < 0:
             raise ValueError(f"forward_kl_weight must be non-negative, got {self.forward_kl_weight}.")
+        if self.confidence_loss_weight < 0:
+            raise ValueError(f"confidence_loss_weight must be non-negative, got {self.confidence_loss_weight}.")
+        if not 0.0 <= self.confidence_tv_target_mix <= 1.0:
+            raise ValueError(
+                f"confidence_tv_target_mix must be in [0, 1], got {self.confidence_tv_target_mix}."
+            )
         if self.loss_mode != "forward_kl_topk" and self.reverse_kl_weight == 0 and self.forward_kl_weight == 0:
             raise ValueError("At least one of reverse_kl_weight or forward_kl_weight must be positive.")
         if self.use_policy_gradient and self.forward_kl_weight > 0:

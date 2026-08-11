@@ -36,6 +36,11 @@ DFLASH_ATTENTION_IMPL_IDS = {
     "flex_attention": 2,
 }
 
+DFLASH_DRAFT_VARIANT_IDS = {
+    "dflash": 0,
+    "dspark": 1,
+}
+
 try:
     from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
@@ -136,6 +141,36 @@ def _set_config_attn_implementation(config: Any, attn_impl: str) -> None:
             setattr(config, attr_name, attn_impl)
 
 
+class StudentVanillaMarkovHead(torch.nn.Module):
+    """Student-side fallback for the SpecForge vanilla DSpark Markov head.
+
+    Low-rank bigram logit bias: Embedding(vocab, rank) + Linear(rank -> vocab).
+    Only instantiated when the DSpark draft's remote code does not carry its own
+    markov_head; the draft model's own implementation is always preferred.
+    """
+
+    def __init__(self, *, vocab_size: int, markov_rank: int):
+        super().__init__()
+        self.vocab_size = int(vocab_size)
+        self.markov_rank = int(markov_rank)
+        self.markov_head_type = "vanilla"
+        if self.markov_rank <= 0:
+            raise ValueError(f"markov_rank must be > 0, got {self.markov_rank}")
+        self.markov_w1 = torch.nn.Embedding(self.vocab_size, self.markov_rank)
+        self.markov_w2 = torch.nn.Linear(self.markov_rank, self.vocab_size, bias=False)
+
+    def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
+        return self.markov_w1(token_ids.long())
+
+    def compute_step_bias(
+        self,
+        token_ids: torch.Tensor,
+        hidden_states: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        del hidden_states
+        return self.markov_w2(self.get_prev_embeddings(token_ids))
+
+
 class ComposedDFlashStudentForCausalLM(PreTrainedModel):
     """Train-only composed model: frozen target model + trainable DFLASH draft."""
 
@@ -167,8 +202,85 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         self.main_model = main_model
         self.draft_model = draft_model
         self.target_layer_ids = resolve_target_layer_ids(main_model=main_model, draft_model=draft_model)
+        self.dspark_markov_head: Optional[torch.nn.Module] = None
+        self.dspark_confidence_head: Optional[torch.nn.Module] = None
+        if self._get_draft_variant() == "dspark":
+            self._init_dspark_fallback_heads()
         self._configure_draft_attention()
         self.freeze_main_model()
+
+    def _get_dspark_dflash_config(self) -> dict:
+        draft_config = getattr(self.draft_model, "config", None)
+        dflash_config = getattr(draft_config, "dflash_config", None) if draft_config is not None else None
+        return dflash_config if isinstance(dflash_config, dict) else {}
+
+    def _has_dspark_draft_markers(self) -> bool:
+        """Auto-detect a DSpark draft from DSpark-specific config fields or heads."""
+        if getattr(self.draft_model, "markov_head", None) is not None:
+            return True
+        if getattr(self.draft_model, "confidence_head", None) is not None:
+            return True
+        dflash_config = self._get_dspark_dflash_config()
+        if not dflash_config:
+            return False
+        if str(dflash_config.get("projector_type", "")).lower() == "dspark":
+            return True
+        if int(dflash_config.get("markov_rank", 0) or 0) > 0:
+            return True
+        if bool(dflash_config.get("enable_confidence_head", False)):
+            return True
+        if bool(dflash_config.get("confidence_head_with_markov", False)):
+            return True
+        return float(dflash_config.get("confidence_head_alpha", 0.0) or 0.0) > 0.0
+
+    def _get_draft_variant(self) -> str:
+        """Draft variant: config override first, env fallback, then auto-detection."""
+        value = getattr(self.config, "verl_dflash_draft_variant", None)
+        if value is None:
+            value = os.getenv("VERL_DFLASH_DRAFT_VARIANT")
+        if value is not None and str(value).strip():
+            variant = str(value).strip().lower()
+            if variant not in DFLASH_DRAFT_VARIANT_IDS:
+                logger.warning(
+                    "Unsupported verl_dflash_draft_variant %s; falling back to 'dflash'.",
+                    value,
+                )
+                return "dflash"
+            return variant
+        return "dspark" if self._has_dspark_draft_markers() else "dflash"
+
+    def _init_dspark_fallback_heads(self) -> None:
+        """Create student-side DSpark heads when the draft remote code lacks them.
+
+        Kept minimal on purpose: this path exists for testability and for drafts
+        whose config declares DSpark heads but whose remote code does not implement
+        them. Production DSpark checkpoints should carry the heads in their own
+        remote code so the weights live under draft_model.* and sync to the engine.
+        """
+        dflash_config = self._get_dspark_dflash_config()
+        draft_config = getattr(self.draft_model, "config", None)
+        markov_rank = int(dflash_config.get("markov_rank", 0) or 0)
+        if getattr(self.draft_model, "markov_head", None) is None and markov_rank > 0:
+            vocab_size = getattr(draft_config, "vocab_size", None) or getattr(self.config, "vocab_size", None)
+            if vocab_size is None:
+                raise ValueError("DSpark fallback Markov head requires a vocab_size on the draft or wrapper config.")
+            self.dspark_markov_head = StudentVanillaMarkovHead(vocab_size=int(vocab_size), markov_rank=markov_rank)
+
+        confidence_enabled = bool(dflash_config.get("enable_confidence_head", False)) or float(
+            dflash_config.get("confidence_head_alpha", 0.0) or 0.0
+        ) > 0.0
+        if getattr(self.draft_model, "confidence_head", None) is None and confidence_enabled:
+            hidden_size = getattr(draft_config, "hidden_size", None) or getattr(self.config, "hidden_size", None)
+            if hidden_size is None:
+                raise ValueError(
+                    "DSpark fallback confidence head requires a hidden_size on the draft or wrapper config."
+                )
+            input_dim = int(hidden_size)
+            if bool(dflash_config.get("confidence_head_with_markov", False)):
+                if markov_rank <= 0:
+                    raise ValueError("confidence_head_with_markov=True requires markov_rank > 0.")
+                input_dim += markov_rank
+            self.dspark_confidence_head = torch.nn.Linear(input_dim, 1)
 
     def _configure_draft_attention(self) -> None:
         requested_impl = (
@@ -417,6 +529,129 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         )
         return self.get_input_embeddings()(noise_ids)
 
+    def _resolve_dspark_markov_head(self):
+        head = getattr(self.draft_model, "markov_head", None)
+        if head is not None:
+            return head
+        return getattr(self, "dspark_markov_head", None)
+
+    def _is_dspark_markov_enabled(self) -> bool:
+        if self._get_draft_variant() != "dspark":
+            return False
+        if self._resolve_dspark_markov_head() is not None:
+            return True
+        return callable(getattr(self.draft_model, "apply_logits_head", None))
+
+    def _is_dspark_confidence_enabled(self) -> bool:
+        if self._get_draft_variant() != "dspark":
+            return False
+        if getattr(self.draft_model, "confidence_head", None) is not None:
+            return True
+        if getattr(self, "dspark_confidence_head", None) is not None:
+            return True
+        return callable(getattr(self.draft_model, "predict_confidence", None))
+
+    def _dspark_confidence_uses_markov(self) -> bool:
+        with_markov = getattr(self.draft_model, "confidence_head_with_markov", None)
+        if with_markov is None:
+            with_markov = self._get_dspark_dflash_config().get("confidence_head_with_markov", False)
+        return bool(with_markov)
+
+    def _create_prev_token_ids_for_anchors(
+        self,
+        input_ids: torch.LongTensor,
+        anchor_positions: torch.Tensor,
+        block_keep_mask: torch.Tensor,
+        block_size: int,
+    ) -> torch.Tensor:
+        """Prev-token chain for the DSpark Markov bias, aligned with SpecForge.
+
+        Draft position j of a block predicts the token at anchor + j, and its
+        Markov bias is driven by the previous token in the chain, i.e. the token
+        at anchor + j - 1 (the anchor token itself for j = 1). For a rejected
+        draft position (j == rejected offset) this is exactly the last accepted
+        token. Everything comes from the recorded response, so no engine-side
+        data is needed. This matches SpecForge's
+        ``prev_token_ids = cat([anchor_token, target_ids[:, :, :-1]])`` with the
+        SpecForge block position k mapping to draft position k + 1 here (the
+        DFlash block includes the anchor position, SpecForge's does not).
+        """
+        batch_size, seq_len = input_ids.shape
+        num_blocks = anchor_positions.shape[1]
+        device = input_ids.device
+        offsets = torch.arange(block_size, device=device).view(1, 1, -1) - 1
+        prev_positions = (anchor_positions.unsqueeze(-1) + offsets).clamp(0, seq_len - 1)
+        prev_token_ids = torch.gather(
+            input_ids.unsqueeze(1).expand(batch_size, num_blocks, seq_len), 2, prev_positions
+        )
+        prev_token_ids = torch.where(
+            block_keep_mask.unsqueeze(-1),
+            prev_token_ids,
+            torch.zeros_like(prev_token_ids),
+        )
+        return prev_token_ids.view(batch_size, num_blocks * block_size)
+
+    def _apply_dspark_markov_bias(
+        self,
+        logits: torch.Tensor,
+        hidden_states: torch.Tensor,
+        prev_token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Add the DSpark Markov bias to chunk-selected logits.
+
+        Preference order: the draft model's own markov_head (remote code), then
+        the student-side fallback head, then the draft model's apply_logits_head
+        entry point. The rnn head carries recurrent state across block steps and
+        is not expressible as a per-position bias, so it is rejected loudly.
+        """
+        head = self._resolve_dspark_markov_head()
+        if head is not None and hasattr(head, "compute_step_bias"):
+            head_type = str(getattr(head, "markov_head_type", "vanilla")).lower()
+            if head_type == "rnn":
+                raise NotImplementedError(
+                    "DSpark OPD replay does not support the rnn Markov head: its bias carries "
+                    "recurrent state across block steps and cannot be replayed per-position."
+                )
+            return logits + head.compute_step_bias(prev_token_ids, hidden_states).to(dtype=logits.dtype)
+        apply_head = getattr(self.draft_model, "apply_logits_head", None)
+        if callable(apply_head):
+            return apply_head(
+                logits,
+                prev_token_ids=prev_token_ids,
+                hidden_states=hidden_states,
+            )
+        return logits
+
+    def _predict_dspark_confidence_logits(
+        self,
+        hidden_states: torch.Tensor,
+        prev_token_ids: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """Raw confidence logits for selected draft positions (None if head absent)."""
+        predict = getattr(self.draft_model, "predict_confidence", None)
+        if callable(predict):
+            confidence = predict(hidden_states, prev_token_ids=prev_token_ids)
+            if confidence is not None:
+                return confidence.float()
+        head = getattr(self.draft_model, "confidence_head", None)
+        if head is None:
+            head = getattr(self, "dspark_confidence_head", None)
+        if head is None:
+            return None
+        features = hidden_states
+        if self._dspark_confidence_uses_markov():
+            if prev_token_ids is None:
+                raise ValueError("confidence_head_with_markov=True requires prev_token_ids.")
+            markov_head = self._resolve_dspark_markov_head()
+            if markov_head is None or not hasattr(markov_head, "get_prev_embeddings"):
+                raise ValueError("confidence_head_with_markov=True requires a Markov head with get_prev_embeddings.")
+            prev_embeddings = markov_head.get_prev_embeddings(prev_token_ids).to(dtype=hidden_states.dtype)
+            features = torch.cat([hidden_states, prev_embeddings], dim=-1)
+        confidence = head(features)
+        if confidence.dim() == features.dim():
+            confidence = confidence.squeeze(-1)
+        return confidence.float()
+
     def _compute_selected_lm_log_probs(
         self,
         *,
@@ -427,6 +662,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         token_ids: torch.LongTensor,
         chunk_size: int,
         calculate_entropy: bool,
+        markov_prev_token_ids: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         if batch_indices.numel() == 0:
             empty = draft_hidden.new_empty((0,), dtype=torch.float32)
@@ -438,6 +674,9 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         for start in range(0, selected_hidden.shape[0], chunk_size):
             end = min(start + chunk_size, selected_hidden.shape[0])
             logits = output_embeddings(selected_hidden[start:end])
+            if markov_prev_token_ids is not None:
+                prev_chunk = markov_prev_token_ids[batch_indices[start:end], draft_indices[start:end]]
+                logits = self._apply_dspark_markov_bias(logits, selected_hidden[start:end], prev_chunk)
             log_probs = F.log_softmax(logits.float(), dim=-1)
             labels = token_ids[start:end].to(device=log_probs.device)
             log_prob_chunks.append(log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1))
@@ -756,6 +995,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         rejected_draft_token_ids: Optional[torch.LongTensor],
         rejected_draft_teacher_logprobs: Optional[torch.Tensor],
         rejected_draft_mask: Optional[torch.Tensor],
+        markov_prev_token_ids: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size = int(prompt_lengths.shape[0])
         rejected_width = 1
@@ -830,9 +1070,120 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                 token_ids=torch.tensor(selected_token_ids, dtype=torch.long, device=draft_hidden.device),
                 chunk_size=lm_head_chunk_size,
                 calculate_entropy=False,
+                markov_prev_token_ids=markov_prev_token_ids,
             )
             student_tensor[selected_item_batch_indices, selected_item_column_indices] = selected_log_probs
         return student_tensor, teacher_tensor, mask_tensor
+
+    def _collect_dspark_confidence_outputs(
+        self,
+        *,
+        draft_hidden: torch.Tensor,
+        prompt_lengths: torch.LongTensor,
+        response_lengths: torch.LongTensor,
+        anchor_positions: torch.LongTensor,
+        block_keep_mask: torch.Tensor,
+        draft_block_size: int,
+        max_tokens_per_sample: Optional[int],
+        rejected_draft_anchor_indices: Optional[torch.LongTensor],
+        rejected_draft_offsets: Optional[torch.LongTensor],
+        rejected_draft_mask: Optional[torch.Tensor],
+        markov_prev_token_ids: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Confidence-head logits and true 0/1 acceptance labels per anchor block.
+
+        For each rejected draft item with in-block offset (= num_accepted + 1):
+        draft positions before the offset were accepted (label 1), the position
+        at the offset was rejected (label 0), and later positions stay unlabeled.
+        Tensors are (batch, rejected_width, draft_block_size) indexed by the
+        in-block draft offset; slot 0 (anchor position) is always unlabeled.
+        """
+        batch_size = int(prompt_lengths.shape[0])
+        rejected_width = 1
+        if rejected_draft_anchor_indices is not None and rejected_draft_anchor_indices.dim() >= 2:
+            rejected_width = max(1, int(rejected_draft_anchor_indices.shape[1]))
+
+        logits_tensor = draft_hidden.new_zeros((batch_size, rejected_width, draft_block_size), dtype=torch.float32)
+        labels_tensor = draft_hidden.new_zeros((batch_size, rejected_width, draft_block_size), dtype=torch.float32)
+        mask_tensor = torch.zeros(
+            (batch_size, rejected_width, draft_block_size), dtype=torch.bool, device=draft_hidden.device
+        )
+        if (
+            rejected_draft_anchor_indices is None
+            or rejected_draft_offsets is None
+            or rejected_draft_mask is None
+            or not bool(rejected_draft_mask.any())
+        ):
+            return logits_tensor, labels_tensor, mask_tensor
+
+        selected_batch_indices: list[int] = []
+        selected_draft_indices: list[int] = []
+        selected_prev_token_ids: list[int] = []
+        selected_labels: list[float] = []
+        selected_slots: list[tuple[int, int, int]] = []
+        selected_counts = [0 for _ in range(batch_size)]
+        for batch_idx in range(batch_size):
+            prompt_len = int(prompt_lengths[batch_idx].item())
+            response_len = int(response_lengths[batch_idx].item())
+            valid_len = prompt_len + response_len
+            for item_idx in range(rejected_width):
+                if not bool(rejected_draft_mask[batch_idx, item_idx].item()):
+                    continue
+                if max_tokens_per_sample is not None and selected_counts[batch_idx] >= max_tokens_per_sample:
+                    continue
+                offset = int(rejected_draft_offsets[batch_idx, item_idx].item())
+                if offset <= 0 or offset >= draft_block_size:
+                    continue
+                anchor_resp = int(rejected_draft_anchor_indices[batch_idx, item_idx].item())
+                full_anchor = prompt_len - 1 if anchor_resp < 0 else prompt_len + anchor_resp
+                if full_anchor < 0 or full_anchor >= valid_len:
+                    continue
+                block_matches = (anchor_positions[batch_idx] == full_anchor) & block_keep_mask[batch_idx]
+                if not bool(block_matches.any()):
+                    continue
+                block_idx = int(torch.nonzero(block_matches, as_tuple=False)[0, 0].item())
+                selected_counts[batch_idx] += 1
+                for draft_offset in range(1, offset + 1):
+                    flat_draft_idx = block_idx * draft_block_size + draft_offset
+                    selected_batch_indices.append(batch_idx)
+                    selected_draft_indices.append(flat_draft_idx)
+                    selected_slots.append((batch_idx, item_idx, draft_offset))
+                    selected_labels.append(0.0 if draft_offset == offset else 1.0)
+                    if markov_prev_token_ids is not None:
+                        selected_prev_token_ids.append(int(markov_prev_token_ids[batch_idx, flat_draft_idx].item()))
+
+        if not selected_batch_indices:
+            return logits_tensor, labels_tensor, mask_tensor
+
+        selected_hidden = draft_hidden[
+            torch.tensor(selected_batch_indices, dtype=torch.long, device=draft_hidden.device),
+            torch.tensor(selected_draft_indices, dtype=torch.long, device=draft_hidden.device),
+            :,
+        ]
+        prev_token_ids_tensor = None
+        if markov_prev_token_ids is not None:
+            prev_token_ids_tensor = torch.tensor(selected_prev_token_ids, dtype=torch.long, device=draft_hidden.device)
+        confidence_logits = self._predict_dspark_confidence_logits(selected_hidden, prev_token_ids_tensor)
+        if confidence_logits is None:
+            return logits_tensor, labels_tensor, mask_tensor
+
+        slot_batch_indices = torch.tensor(
+            [batch_idx for batch_idx, _, _ in selected_slots], dtype=torch.long, device=draft_hidden.device
+        )
+        slot_item_indices = torch.tensor(
+            [item_idx for _, item_idx, _ in selected_slots], dtype=torch.long, device=draft_hidden.device
+        )
+        slot_draft_offsets = torch.tensor(
+            [draft_offset for _, _, draft_offset in selected_slots], dtype=torch.long, device=draft_hidden.device
+        )
+        logits_tensor[slot_batch_indices, slot_item_indices, slot_draft_offsets] = confidence_logits.to(
+            dtype=torch.float32
+        )
+        labels_tensor[slot_batch_indices, slot_item_indices, slot_draft_offsets] = torch.tensor(
+            selected_labels, dtype=torch.float32, device=draft_hidden.device
+        )
+        mask_tensor[slot_batch_indices, slot_item_indices, slot_draft_offsets] = True
+        return logits_tensor, labels_tensor, mask_tensor
 
     def _run_dflash_draft_forward(
         self,
@@ -1072,6 +1423,26 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
             )
         draft_q_token_count = padded_block_count * draft_block_size
 
+        draft_variant = self._get_draft_variant()
+        dspark_markov_enabled = self._is_dspark_markov_enabled()
+        dspark_confidence_enabled = self._is_dspark_confidence_enabled()
+        markov_prev_token_ids = None
+        rejected_markov_prev_token_ids = None
+        if dspark_markov_enabled or dspark_confidence_enabled:
+            markov_prev_token_ids = self._create_prev_token_ids_for_anchors(
+                input_ids=input_ids,
+                anchor_positions=anchor_positions,
+                block_keep_mask=block_keep_mask,
+                block_size=draft_block_size,
+            )
+            if split_random_rejected_pass and bool(rejected_block_keep_mask.any()):
+                rejected_markov_prev_token_ids = self._create_prev_token_ids_for_anchors(
+                    input_ids=input_ids,
+                    anchor_positions=rejected_anchor_positions,
+                    block_keep_mask=rejected_block_keep_mask,
+                    block_size=draft_block_size,
+                )
+
         output_embeddings = self.get_output_embeddings()
         if output_embeddings is None:
             raise RuntimeError("Main model output embeddings are required for composed DFLASH student logits.")
@@ -1090,6 +1461,9 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         rejected_teacher_log_probs = target_hidden.new_zeros((batch_size, rejected_width), dtype=torch.float32)
         rejected_loss_mask = torch.zeros((batch_size, rejected_width), dtype=torch.bool, device=input_ids.device)
         response_lm_token_count = 0
+        confidence_logits: Optional[torch.Tensor] = None
+        confidence_labels: Optional[torch.Tensor] = None
+        confidence_mask: Optional[torch.Tensor] = None
         attn_impl = str(getattr(getattr(self.draft_model, "config", None), "_attn_implementation", "eager"))
         ran_draft_forward = False
 
@@ -1145,6 +1519,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                     token_ids=response_label_tensor,
                     chunk_size=lm_head_chunk_size,
                     calculate_entropy=calculate_entropy,
+                    markov_prev_token_ids=markov_prev_token_ids if dspark_markov_enabled else None,
                 )
                 log_probs_by_seq[response_batch_tensor, response_row_tensor] = selected_log_probs
                 loss_mask_by_seq[response_batch_tensor, response_row_tensor] = 1.0
@@ -1169,7 +1544,22 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                         rejected_draft_token_ids=rejected_draft_token_ids,
                         rejected_draft_teacher_logprobs=rejected_draft_teacher_logprobs,
                         rejected_draft_mask=rejected_draft_mask,
+                        markov_prev_token_ids=markov_prev_token_ids if dspark_markov_enabled else None,
                     )
+                )
+            if dspark_confidence_enabled and not split_random_rejected_pass:
+                confidence_logits, confidence_labels, confidence_mask = self._collect_dspark_confidence_outputs(
+                    draft_hidden=draft_hidden,
+                    prompt_lengths=prompt_lengths,
+                    response_lengths=response_lengths,
+                    anchor_positions=anchor_positions,
+                    block_keep_mask=block_keep_mask,
+                    draft_block_size=draft_block_size,
+                    max_tokens_per_sample=rejected_draft_max_tokens_per_sample,
+                    rejected_draft_anchor_indices=rejected_draft_anchor_indices,
+                    rejected_draft_offsets=rejected_draft_offsets,
+                    rejected_draft_mask=rejected_draft_mask,
+                    markov_prev_token_ids=markov_prev_token_ids,
                 )
             del draft_hidden
 
@@ -1202,8 +1592,23 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                     rejected_draft_token_ids=rejected_draft_token_ids,
                     rejected_draft_teacher_logprobs=rejected_draft_teacher_logprobs,
                     rejected_draft_mask=rejected_draft_mask,
+                    markov_prev_token_ids=rejected_markov_prev_token_ids if dspark_markov_enabled else None,
                 )
             )
+            if dspark_confidence_enabled:
+                confidence_logits, confidence_labels, confidence_mask = self._collect_dspark_confidence_outputs(
+                    draft_hidden=rejected_draft_hidden,
+                    prompt_lengths=prompt_lengths,
+                    response_lengths=response_lengths,
+                    anchor_positions=rejected_anchor_positions,
+                    block_keep_mask=rejected_block_keep_mask,
+                    draft_block_size=draft_block_size,
+                    max_tokens_per_sample=rejected_draft_max_tokens_per_sample,
+                    rejected_draft_anchor_indices=rejected_draft_anchor_indices,
+                    rejected_draft_offsets=rejected_draft_offsets,
+                    rejected_draft_mask=rejected_draft_mask,
+                    markov_prev_token_ids=rejected_markov_prev_token_ids,
+                )
             del rejected_draft_hidden
 
         if not ran_draft_forward:
@@ -1253,6 +1658,25 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                 DFLASH_ATTENTION_IMPL_IDS.get(attn_impl, -1)
             ),
         }
+        if draft_variant == "dspark":
+            output["dflash_opd_draft_variant_id"] = log_probs_by_seq.new_tensor(
+                DFLASH_DRAFT_VARIANT_IDS[draft_variant]
+            )
+        if dspark_confidence_enabled:
+            if confidence_logits is None or confidence_labels is None or confidence_mask is None:
+                confidence_logits = target_hidden.new_zeros(
+                    (batch_size, rejected_width, draft_block_size), dtype=torch.float32
+                )
+                confidence_labels = target_hidden.new_zeros(
+                    (batch_size, rejected_width, draft_block_size), dtype=torch.float32
+                )
+                confidence_mask = torch.zeros(
+                    (batch_size, rejected_width, draft_block_size), dtype=torch.bool, device=input_ids.device
+                )
+            output["dflash_dspark_confidence_logits"] = confidence_logits
+            output["dflash_dspark_confidence_labels"] = confidence_labels
+            output["dflash_dspark_confidence_mask"] = confidence_mask
+            output["dflash_opd_dspark_confidence_token_count"] = confidence_mask.sum().to(dtype=torch.float32)
         if profile_enabled:
             output.update(
                 {
