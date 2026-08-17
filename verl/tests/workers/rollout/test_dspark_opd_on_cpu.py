@@ -21,7 +21,11 @@ import torch.nn.functional as F
 from tensordict import TensorDict
 from transformers import PretrainedConfig
 
-from verl.models.transformers.dflash_student import ComposedDFlashStudentForCausalLM, StudentVanillaMarkovHead
+from verl.models.transformers.dflash_student import (
+    ComposedDFlashStudentForCausalLM,
+    StudentVanillaMarkovHead,
+    resolve_target_layer_ids,
+)
 from verl.trainer.distillation.losses import distillation_loss, get_dspark_confidence_stream
 from verl.trainer.ppo.core_algos import kl_penalty
 
@@ -36,6 +40,12 @@ def _bare_student(draft_model=None, config=None):
 def _plain_draft(dflash_config=None, **attrs):
     config = SimpleNamespace(dflash_config=dflash_config or {})
     return SimpleNamespace(config=config, **attrs)
+
+
+def _flat_dspark_draft(**config_attrs):
+    """Mimic DSpark checkpoints (e.g. deepseek-ai/dspark_qwen3_4b_block7): no
+    nested dflash_config; the DFlash-style keys live at the config top level."""
+    return SimpleNamespace(config=SimpleNamespace(dflash_config=None, **config_attrs))
 
 
 def _make_markov_head(vocab_size=8, markov_rank=2):
@@ -89,6 +99,34 @@ def test_draft_variant_config_and_env_override(monkeypatch):
     monkeypatch.setenv("VERL_DFLASH_DRAFT_VARIANT", "dspark")
     student = _bare_student()
     assert student._get_draft_variant() == "dspark"
+
+
+def test_dspark_flat_config_mask_token_id_view_and_variant():
+    draft = _flat_dspark_draft(mask_token_id=151669, markov_rank=256, enable_confidence_head=True)
+    student = _bare_student(draft_model=draft)
+    assert student._get_mask_token_id() == 151669
+    view = student._get_dspark_dflash_config()
+    assert view["markov_rank"] == 256
+    assert view["enable_confidence_head"] is True
+    # flat markers also drive variant auto-detection
+    assert student._get_draft_variant() == "dspark"
+
+
+def test_mask_token_id_nested_dict_shape_unchanged():
+    student = _bare_student(draft_model=_plain_draft({"mask_token_id": 151669}))
+    assert student._get_mask_token_id() == 151669
+
+
+def test_mask_token_id_missing_raises():
+    student = _bare_student()
+    with pytest.raises(ValueError, match="mask_token_id"):
+        student._get_mask_token_id()
+
+
+def test_resolve_target_layer_ids_flat_config():
+    main_model = SimpleNamespace(config=SimpleNamespace(num_hidden_layers=36))
+    draft = _flat_dspark_draft(target_layer_ids=[1, 9, 17, 25, 33], num_hidden_layers=5)
+    assert resolve_target_layer_ids(main_model, draft) == [1, 9, 17, 25, 33]
 
 
 def test_dspark_prev_token_chain_matches_specforge_contract():

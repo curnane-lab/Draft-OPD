@@ -60,14 +60,47 @@ def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> lis
     return [int(round(start + (i * span) / (num_draft_layers - 1))) for i in range(num_draft_layers)]
 
 
+# Keys DSpark checkpoints declare at the draft config top level instead of a
+# nested ``dflash_config`` dict (e.g. deepseek-ai/dspark_qwen3_4b_block7).
+_DFLASH_FLAT_CONFIG_KEYS = (
+    "mask_token_id",
+    "target_layer_ids",
+    "projector_type",
+    "markov_rank",
+    "markov_head_type",
+    "enable_confidence_head",
+    "confidence_head_with_markov",
+    "confidence_head_alpha",
+)
+
+
+def draft_dflash_config_view(draft_model: PreTrainedModel) -> dict:
+    """Return the draft's DFlash-style config as a dict.
+
+    DFlash drafts nest these keys under ``config.dflash_config``; DSpark drafts
+    keep them at the config top level. Both shapes are normalized here.
+    """
+    draft_config = getattr(draft_model, "config", None)
+    nested = getattr(draft_config, "dflash_config", None) if draft_config is not None else None
+    if isinstance(nested, dict):
+        return nested
+    if draft_config is None:
+        return {}
+    view = {}
+    for key in _DFLASH_FLAT_CONFIG_KEYS:
+        value = getattr(draft_config, key, None)
+        if value is not None:
+            view[key] = value
+    return view
+
+
 def resolve_target_layer_ids(main_model: PreTrainedModel, draft_model: PreTrainedModel) -> list[int]:
     if hasattr(draft_model, "target_layer_ids") and getattr(draft_model, "target_layer_ids") is not None:
         return [int(layer_id) for layer_id in getattr(draft_model, "target_layer_ids")]
 
-    draft_config = getattr(draft_model, "config", None)
-    dflash_config = getattr(draft_config, "dflash_config", None) if draft_config is not None else None
-    if isinstance(dflash_config, dict) and dflash_config.get("target_layer_ids") is not None:
-        return [int(layer_id) for layer_id in dflash_config["target_layer_ids"]]
+    target_layer_ids = draft_dflash_config_view(draft_model).get("target_layer_ids")
+    if target_layer_ids is not None:
+        return [int(layer_id) for layer_id in target_layer_ids]
 
     num_target_layers = int(getattr(main_model.config, "num_hidden_layers"))
     num_draft_layers = int(getattr(draft_model.config, "num_hidden_layers"))
@@ -210,9 +243,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         self.freeze_main_model()
 
     def _get_dspark_dflash_config(self) -> dict:
-        draft_config = getattr(self.draft_model, "config", None)
-        dflash_config = getattr(draft_config, "dflash_config", None) if draft_config is not None else None
-        return dflash_config if isinstance(dflash_config, dict) else {}
+        return draft_dflash_config_view(self.draft_model)
 
     def _has_dspark_draft_markers(self) -> bool:
         """Auto-detect a DSpark draft from DSpark-specific config fields or heads."""
@@ -402,13 +433,11 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
     def _get_mask_token_id(self) -> int:
         mask_token_id = getattr(self.draft_model, "mask_token_id", None)
         if mask_token_id is None:
-            draft_config = getattr(self.draft_model, "config", None)
-            dflash_config = getattr(draft_config, "dflash_config", None) if draft_config is not None else None
-            if isinstance(dflash_config, dict):
-                mask_token_id = dflash_config.get("mask_token_id")
+            mask_token_id = self._get_dspark_dflash_config().get("mask_token_id")
         if mask_token_id is None:
             raise ValueError(
-                "DFLASH OPD requires draft_model.mask_token_id or config.dflash_config['mask_token_id']."
+                "DFLASH OPD requires draft_model.mask_token_id or a draft config mask_token_id "
+                "(nested dflash_config or, for DSpark drafts, the config top level)."
             )
         return int(mask_token_id)
 
