@@ -19,13 +19,14 @@ import pytest
 import torch
 import torch.nn.functional as F
 from tensordict import TensorDict
-from transformers import PretrainedConfig
+from transformers import PretrainedConfig, Qwen3Config
 
 from verl.models.transformers.dflash_student import (
     ComposedDFlashStudentForCausalLM,
     StudentVanillaMarkovHead,
     resolve_target_layer_ids,
 )
+from verl.models.transformers.dspark_draft import DSparkDraftModel, draft_config_has_dspark_markers
 from verl.trainer.distillation.losses import distillation_loss, get_dspark_confidence_stream
 from verl.trainer.ppo.core_algos import kl_penalty
 
@@ -127,6 +128,117 @@ def test_resolve_target_layer_ids_flat_config():
     main_model = SimpleNamespace(config=SimpleNamespace(num_hidden_layers=36))
     draft = _flat_dspark_draft(target_layer_ids=[1, 9, 17, 25, 33], num_hidden_layers=5)
     assert resolve_target_layer_ids(main_model, draft) == [1, 9, 17, 25, 33]
+
+
+def _tiny_dspark_draft_config():
+    config = Qwen3Config(
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        vocab_size=64,
+        max_position_embeddings=128,
+    )
+    config.block_size = 3
+    config.target_layer_ids = [1, 3]
+    config.mask_token_id = 63
+    config.num_anchors = 4
+    config.markov_rank = 4
+    config.markov_head_type = "vanilla"
+    config.enable_confidence_head = True
+    config.confidence_head_with_markov = True
+    config._attn_implementation = "eager"
+    return config
+
+
+def test_draft_config_has_dspark_markers_detection():
+    by_arch = PretrainedConfig()
+    by_arch.architectures = ["Qwen3DSparkModel"]
+    assert draft_config_has_dspark_markers(by_arch)
+
+    # DFlash checkpoints ship their own remote code: stay on the AutoModel path.
+    with_remote_code = PretrainedConfig()
+    with_remote_code.architectures = ["DFlashDraftModel"]
+    with_remote_code.auto_map = {"AutoModel": "dflash.DFlashDraftModel"}
+    assert not draft_config_has_dspark_markers(with_remote_code)
+
+    by_flat_keys = PretrainedConfig()
+    by_flat_keys.markov_rank = 256
+    assert draft_config_has_dspark_markers(by_flat_keys)
+
+    assert not draft_config_has_dspark_markers(PretrainedConfig())
+
+
+def test_dspark_draft_forward_matches_student_call_convention():
+    torch.manual_seed(0)
+    config = _tiny_dspark_draft_config()
+    model = DSparkDraftModel(config).eval()
+    batch, ctx_len, q_len = 2, 7, 6
+    noise_embedding = torch.randn(batch, q_len, config.hidden_size)
+    target_hidden = torch.randn(batch, ctx_len, len(config.target_layer_ids) * config.hidden_size)
+    position_ids = torch.arange(ctx_len + q_len).unsqueeze(0).expand(batch, -1)
+    with torch.no_grad():
+        out = model(
+            position_ids=position_ids,
+            attention_mask=None,
+            noise_embedding=noise_embedding,
+            target_hidden=target_hidden,
+            use_cache=False,
+        )
+    assert out.shape == (batch, q_len, config.hidden_size)
+
+
+def test_dspark_draft_checkpoint_weight_name_contract():
+    model = DSparkDraftModel(_tiny_dspark_draft_config())
+    keys = set(model.state_dict())
+    expected = {
+        "embed_tokens.weight",
+        "lm_head.weight",
+        "fc.weight",
+        "hidden_norm.weight",
+        "norm.weight",
+        "markov_head.markov_w1.weight",
+        "markov_head.markov_w2.weight",
+        "confidence_head.proj.weight",
+        "confidence_head.proj.bias",
+        "layers.0.self_attn.q_proj.weight",
+        "layers.0.self_attn.q_norm.weight",
+        "layers.0.input_layernorm.weight",
+        "layers.0.mlp.down_proj.weight",
+        "layers.1.self_attn.o_proj.weight",
+    }
+    assert expected <= keys
+    # confidence_head_with_markov widens the predictor input by the Markov rank
+    config = _tiny_dspark_draft_config()
+    assert model.confidence_head.proj.in_features == config.hidden_size + config.markov_rank
+
+
+def test_dspark_draft_predict_confidence_with_markov():
+    model = DSparkDraftModel(_tiny_dspark_draft_config()).eval()
+    hidden = torch.randn(2, 5, 16)
+    prev_token_ids = torch.randint(0, 64, (2, 5))
+    with torch.no_grad():
+        confidence = model.predict_confidence(hidden, prev_token_ids=prev_token_ids)
+    assert confidence.shape == (2, 5)
+    with pytest.raises(ValueError, match="prev_token_ids"):
+        model.predict_confidence(hidden)
+
+
+def test_dspark_draft_from_pretrained_roundtrip(tmp_path):
+    torch.manual_seed(0)
+    model = DSparkDraftModel(_tiny_dspark_draft_config()).eval()
+    model.save_pretrained(tmp_path)
+    loaded = DSparkDraftModel.from_pretrained(tmp_path)
+    loaded.config._attn_implementation = "eager"
+    loaded.eval()
+    noise_embedding = torch.randn(1, 3, 16)
+    target_hidden = torch.randn(1, 5, 32)
+    position_ids = torch.arange(8).unsqueeze(0)
+    with torch.no_grad():
+        ref = model(position_ids=position_ids, noise_embedding=noise_embedding, target_hidden=target_hidden)
+        out = loaded(position_ids=position_ids, noise_embedding=noise_embedding, target_hidden=target_hidden)
+    assert torch.allclose(ref, out, atol=1e-6)
 
 
 def test_dspark_prev_token_chain_matches_specforge_contract():

@@ -27,6 +27,8 @@ import torch.utils.checkpoint as torch_checkpoint
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, PreTrainedModel, PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from verl.models.transformers.dspark_draft import DSparkDraftModel, draft_config_has_dspark_markers
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -1837,20 +1839,31 @@ def build_composed_dflash_student(
         trust_remote_code=trust_remote_code,
     )
 
-    try:
-        draft_model = AutoModel.from_pretrained(
+    draft_config = AutoConfig.from_pretrained(draft_model_path, trust_remote_code=True)
+    if draft_config_has_dspark_markers(draft_config):
+        # Official DSpark checkpoints ship no remote code; plain AutoModel would
+        # silently build a stock Qwen3 backbone. Load the vendored DSpark draft
+        # architecture so the OPD replay gets the target-context attention and
+        # the Markov/confidence heads with checkpoint-matching weight names.
+        draft_model = DSparkDraftModel.from_pretrained(
             pretrained_model_name_or_path=draft_model_path,
+            config=draft_config,
             torch_dtype=torch_dtype,
-            trust_remote_code=True,
         )
-    except OSError as exc:
-        logger.warning(
-            "Failed to load draft model weights from %s (%s). Falling back to config-only initialization.",
-            draft_model_path,
-            exc,
-        )
-        draft_config = AutoConfig.from_pretrained(draft_model_path, trust_remote_code=True)
-        draft_model = AutoModel.from_config(draft_config, trust_remote_code=True)
+    else:
+        try:
+            draft_model = AutoModel.from_pretrained(
+                pretrained_model_name_or_path=draft_model_path,
+                torch_dtype=torch_dtype,
+                trust_remote_code=True,
+            )
+        except OSError as exc:
+            logger.warning(
+                "Failed to load draft model weights from %s (%s). Falling back to config-only initialization.",
+                draft_model_path,
+                exc,
+            )
+            draft_model = AutoModel.from_config(draft_config, trust_remote_code=True)
 
     model = ComposedDFlashStudentForCausalLM(config=config, main_model=main_model, draft_model=draft_model)
     return model
