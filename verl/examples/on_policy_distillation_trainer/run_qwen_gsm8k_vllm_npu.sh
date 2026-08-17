@@ -96,7 +96,9 @@ ENABLE_THINKING=${ENABLE_THINKING:-False}
 # plus the draft segments OOM update_actor even with the anchor cap.
 GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-True}
 DRAFT_MODEL_PATH=${DRAFT_MODEL_PATH:-""} # your DFlash draft model path.
-NUM_SPECULATIVE_TOKENS=${NUM_SPECULATIVE_TOKENS:-7} # DFlash block size K.
+MTP_METHOD=${MTP_METHOD:-dflash} # speculative method: dflash or dspark (upstreamed in the pinned engines).
+# DFlash block size K. For dspark (block_size 7 = anchor + 6 predictions) use 6.
+NUM_SPECULATIVE_TOKENS=${NUM_SPECULATIVE_TOKENS:-7}
 TRAIN_JSONL=${TRAIN_JSONL:-""} # your data path.
 TRAIN_JSONL_FILENAME="$(basename "$TRAIN_JSONL")"
 TRAIN_JSONL_NAME="${TRAIN_JSONL_FILENAME%.jsonl}"
@@ -131,7 +133,7 @@ exec "${SCRIPT_DIR}/run_qwen_gsm8k.sh" \
     ++actor_rollout_ref.rollout.mtp._target_=verl.workers.config.MtpConfig \
     ++actor_rollout_ref.rollout.mtp.enable=True \
     ++actor_rollout_ref.rollout.mtp.enable_rollout=True \
-    ++actor_rollout_ref.rollout.mtp.method=dflash \
+    ++actor_rollout_ref.rollout.mtp.method="${MTP_METHOD}" \
     ++actor_rollout_ref.rollout.mtp.num_speculative_tokens="${NUM_SPECULATIVE_TOKENS}" \
     ++actor_rollout_ref.rollout.mtp.draft_model_path="${DRAFT_MODEL_PATH}" \
     "+actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config=\"${_VLLM_COMPILATION_CONFIG_ESCAPED}\"" \
