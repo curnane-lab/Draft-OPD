@@ -193,8 +193,6 @@ def test_dspark_draft_checkpoint_weight_name_contract():
     model = DSparkDraftModel(_tiny_dspark_draft_config())
     keys = set(model.state_dict())
     expected = {
-        "embed_tokens.weight",
-        "lm_head.weight",
         "fc.weight",
         "hidden_norm.weight",
         "norm.weight",
@@ -209,6 +207,16 @@ def test_dspark_draft_checkpoint_weight_name_contract():
         "layers.1.self_attn.o_proj.weight",
     }
     assert expected <= keys
+    # embed_tokens/lm_head are deliberately omitted: the composed student uses
+    # the frozen target model's embedding and output head, and the rollout
+    # engine loads its own copies from the checkpoint (DeepSpec keeps them
+    # frozen). Not carrying them shrinks the FSDP flat-parameter peak.
+    assert "embed_tokens.weight" not in keys
+    assert "lm_head.weight" not in keys
+    # Official checkpoints do contain those tensors; loading must tolerate them.
+    extra = {"embed_tokens.weight": torch.zeros(64, 16), "lm_head.weight": torch.zeros(64, 16)}
+    _, unexpected = model.load_state_dict({**model.state_dict(), **extra}, strict=False)
+    assert set(unexpected) == set(extra)
     # confidence_head_with_markov widens the predictor input by the Markov rank
     config = _tiny_dspark_draft_config()
     assert model.confidence_head.proj.in_features == config.hidden_size + config.markov_rank

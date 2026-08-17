@@ -291,9 +291,19 @@ def draft_config_has_dspark_markers(config) -> bool:
 class DSparkDraftModel(Qwen3PreTrainedModel):
     """DSpark block-draft backbone (DeepSeek DeepSpec reference architecture).
 
-    Loads the official checkpoints directly: module tree matches
-    ``embed_tokens`` / ``layers`` / ``norm`` / ``fc`` / ``hidden_norm`` /
-    ``lm_head`` / ``markov_head`` / ``confidence_head``.
+    Loads the official checkpoints directly: module tree matches the
+    checkpoint's ``layers`` / ``norm`` / ``fc`` / ``hidden_norm`` /
+    ``markov_head`` / ``confidence_head``.
+
+    Unlike the DeepSpec reference, this class deliberately omits the draft's
+    own ``embed_tokens`` and ``lm_head``: the composed student embeds noise
+    tokens and computes logits through the frozen target model, and the
+    rollout engine loads its own copies from the checkpoint (DeepSpec keeps
+    them frozen at the target's values anyway). Dropping ~0.78B dead-weight
+    params materially shrinks the FSDP flat-parameter allocation peak
+    (~3.1 GiB fp32 for Qwen3-4B drafts) plus the per-step weight-sync
+    traffic. ``from_pretrained`` simply reports the checkpoint's
+    embed/head tensors as unused unexpected keys.
     """
 
     _no_split_modules = ["DSparkDecoderLayer"]
@@ -306,11 +316,6 @@ class DSparkDraftModel(Qwen3PreTrainedModel):
                 raise ValueError(f"DSpark draft config.{field} must be provided.")
         self.target_layer_ids = [int(layer_id) for layer_id in config.target_layer_ids]
 
-        self.embed_tokens = nn.Embedding(
-            config.vocab_size,
-            config.hidden_size,
-            padding_idx=getattr(config, "pad_token_id", None),
-        )
         self.layers = nn.ModuleList(
             [DSparkDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
@@ -318,7 +323,6 @@ class DSparkDraftModel(Qwen3PreTrainedModel):
         self.rotary_emb = Qwen3RotaryEmbedding(config)
         self.fc = nn.Linear(len(self.target_layer_ids) * config.hidden_size, config.hidden_size, bias=False)
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.block_size = int(config.block_size)
         self.mask_token_id = getattr(config, "mask_token_id", None)
 
