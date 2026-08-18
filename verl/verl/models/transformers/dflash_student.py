@@ -96,6 +96,59 @@ def draft_dflash_config_view(draft_model: PreTrainedModel) -> dict:
     return view
 
 
+def compute_dspark_group_grad_norms(module: torch.nn.Module) -> dict[str, float]:
+    """Per-group gradient L2 norms for the composed DFlash/DSpark student.
+
+    Groups: ``markov`` (draft ``markov_head.*``), ``confidence`` (draft
+    ``confidence_head.*``), ``draft_backbone`` (the rest of ``draft_model.*``)
+    and ``other`` (frozen target, expected ~0). Relies on the composed student
+    being wrapped with FSDP ``use_orig_params=True`` (forced on for it), so
+    original parameter names and sharded ``.grad`` views are available; the
+    squared sums are all-reduced across the FSDP process group when running
+    distributed.
+    """
+    group_sums = {"markov": 0.0, "confidence": 0.0, "draft_backbone": 0.0, "other": 0.0}
+    for name, param in module.named_parameters():
+        grad = param.grad
+        if grad is None:
+            continue
+        sq = float(grad.detach().float().pow(2).sum().item())
+        if "markov_head" in name:
+            group_sums["markov"] += sq
+        elif "confidence_head" in name:
+            group_sums["confidence"] += sq
+        elif "draft_model" in name:
+            group_sums["draft_backbone"] += sq
+        else:
+            group_sums["other"] += sq
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+    if isinstance(module, FSDP) and torch.distributed.is_available() and torch.distributed.is_initialized():
+        keys = list(group_sums)
+        device = next(module.parameters()).device
+        packed = torch.tensor([group_sums[k] for k in keys], dtype=torch.float32, device=device)
+        torch.distributed.all_reduce(packed, group=module.process_group)
+        group_sums = {k: float(packed[i].item()) for i, k in enumerate(keys)}
+    return {k: v**0.5 for k, v in group_sums.items()}
+
+
+def freeze_dspark_markov_heads(student) -> int:
+    """Freeze the DSpark Markov head(s) for the VERL_DSPARK_FREEZE_MARKOV ablation.
+
+    Freezes the draft model's own head and, when present, the student-side
+    fallback head; the bias itself stays applied on both the training and the
+    engine side. Returns the number of frozen tensors.
+    """
+    frozen = 0
+    for head in (getattr(student.draft_model, "markov_head", None), getattr(student, "dspark_markov_head", None)):
+        if head is None:
+            continue
+        for param in head.parameters():
+            param.requires_grad_(False)
+            frozen += 1
+    return frozen
+
+
 def resolve_target_layer_ids(main_model: PreTrainedModel, draft_model: PreTrainedModel) -> list[int]:
     if hasattr(draft_model, "target_layer_ids") and getattr(draft_model, "target_layer_ids") is not None:
         return [int(layer_id) for layer_id in getattr(draft_model, "target_layer_ids")]
@@ -1866,4 +1919,7 @@ def build_composed_dflash_student(
             draft_model = AutoModel.from_config(draft_config, trust_remote_code=True)
 
     model = ComposedDFlashStudentForCausalLM(config=config, main_model=main_model, draft_model=draft_model)
+    if os.getenv("VERL_DSPARK_FREEZE_MARKOV") == "1":
+        frozen = freeze_dspark_markov_heads(model)
+        logger.warning("VERL_DSPARK_FREEZE_MARKOV=1: froze %d Markov head tensor(s) (ablation).", frozen)
     return model

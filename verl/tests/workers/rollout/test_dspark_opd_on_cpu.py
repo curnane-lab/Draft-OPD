@@ -24,6 +24,8 @@ from transformers import PretrainedConfig, Qwen3Config
 from verl.models.transformers.dflash_student import (
     ComposedDFlashStudentForCausalLM,
     StudentVanillaMarkovHead,
+    compute_dspark_group_grad_norms,
+    freeze_dspark_markov_heads,
     resolve_target_layer_ids,
 )
 from verl.models.transformers.dspark_draft import DSparkDraftModel, draft_config_has_dspark_markers
@@ -247,6 +249,35 @@ def test_dspark_draft_from_pretrained_roundtrip(tmp_path):
         ref = model(position_ids=position_ids, noise_embedding=noise_embedding, target_hidden=target_hidden)
         out = loaded(position_ids=position_ids, noise_embedding=noise_embedding, target_hidden=target_hidden)
     assert torch.allclose(ref, out, atol=1e-6)
+
+
+def test_freeze_dspark_markov_heads_freezes_only_markov():
+    model = DSparkDraftModel(_tiny_dspark_draft_config())
+    student = SimpleNamespace(draft_model=model)  # no fallback head on the student
+    for param in model.parameters():
+        param.requires_grad_(True)
+    frozen = freeze_dspark_markov_heads(student)
+    assert frozen == 2  # markov_w1 + markov_w2
+    assert all(not p.requires_grad for p in model.markov_head.parameters())
+    assert all(p.requires_grad for n, p in model.named_parameters() if "markov_head" not in n)
+
+
+def test_compute_dspark_group_grad_norms_buckets_by_name():
+    model = DSparkDraftModel(_tiny_dspark_draft_config())
+    wrapper = torch.nn.Module()
+    wrapper.draft_model = model  # composed-student-style "draft_model.*" names
+    for param in wrapper.parameters():
+        param.grad = torch.ones_like(param)
+    norms = compute_dspark_group_grad_norms(wrapper)
+
+    def expected(pred):
+        return sum(p.numel() for n, p in wrapper.named_parameters() if pred(n)) ** 0.5
+
+    assert norms["markov"] == pytest.approx(expected(lambda n: "markov_head" in n), rel=1e-4)
+    assert norms["confidence"] == pytest.approx(expected(lambda n: "confidence_head" in n), rel=1e-4)
+    backbone = expected(lambda n: "markov_head" not in n and "confidence_head" not in n)
+    assert norms["draft_backbone"] == pytest.approx(backbone, rel=1e-4)
+    assert norms["other"] == 0.0
 
 
 def test_dspark_prev_token_chain_matches_specforge_contract():

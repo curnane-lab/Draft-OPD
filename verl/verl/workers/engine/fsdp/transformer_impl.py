@@ -728,6 +728,17 @@ class FSDPEngine(BaseEngine):
         """
         assert self.optimizer_config.clip_grad is not None
 
+        if os.environ.get("VERL_DSPARK_GRAD_GROUP_NORM") == "1":
+            # Diagnostic probe (DSpark OPD): report per-group pre-clip grad norms
+            # to localize which draft subtree dominates the gradient.
+            try:
+                from verl.models.transformers.dflash_student import compute_dspark_group_grad_norms
+
+                group_norms = compute_dspark_group_grad_norms(self.module)
+                print("DSPARK_GRAD_NORM " + " ".join(f"{k}={v:.4g}" for k, v in group_norms.items()), flush=True)
+            except Exception as exc:  # diagnostic only; never break training
+                print(f"DSPARK_GRAD_NORM probe failed: {exc}", flush=True)
+
         if isinstance(self.module, FSDP):
             grad_norm = self.module.clip_grad_norm_(self.optimizer_config.clip_grad)
         elif isinstance(self.module, FSDPModule):
