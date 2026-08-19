@@ -712,6 +712,13 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         prev_token_ids: Optional[torch.Tensor],
     ) -> Optional[torch.Tensor]:
         """Raw confidence logits for selected draft positions (None if head absent)."""
+        detach_features = os.getenv("VERL_DSPARK_DETACH_CONFIDENCE") == "1"
+        if detach_features:
+            # Keep confidence-head gradients out of the draft backbone. DeepSpec's
+            # offline training can afford a joint head (CE/L1 gradients dominate);
+            # in OPD replay the distillation gradients are small, so an undetached
+            # confidence head ends up steering the backbone update direction.
+            hidden_states = hidden_states.detach()
         predict = getattr(self.draft_model, "predict_confidence", None)
         if callable(predict):
             confidence = predict(hidden_states, prev_token_ids=prev_token_ids)
@@ -730,6 +737,8 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
             if markov_head is None or not hasattr(markov_head, "get_prev_embeddings"):
                 raise ValueError("confidence_head_with_markov=True requires a Markov head with get_prev_embeddings.")
             prev_embeddings = markov_head.get_prev_embeddings(prev_token_ids).to(dtype=hidden_states.dtype)
+            if detach_features:
+                prev_embeddings = prev_embeddings.detach()
             features = torch.cat([hidden_states, prev_embeddings], dim=-1)
         confidence = head(features)
         if confidence.dim() == features.dim():

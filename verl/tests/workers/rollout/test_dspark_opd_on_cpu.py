@@ -280,6 +280,25 @@ def test_compute_dspark_group_grad_norms_buckets_by_name():
     assert norms["other"] == 0.0
 
 
+def test_confidence_hidden_detached_under_env(monkeypatch):
+    model = DSparkDraftModel(_tiny_dspark_draft_config())
+    student = _bare_student()
+    student.__dict__["draft_model"] = model  # bypass nn.Module.__setattr__ (bare instance)
+    prev_token_ids = torch.randint(0, 64, (2, 5))
+
+    monkeypatch.setenv("VERL_DSPARK_DETACH_CONFIDENCE", "1")
+    hidden = torch.randn(2, 5, 16, requires_grad=True)
+    confidence = student._predict_dspark_confidence_logits(hidden, prev_token_ids)
+    confidence.sum().backward()
+    assert hidden.grad is None  # backbone path cut
+
+    monkeypatch.delenv("VERL_DSPARK_DETACH_CONFIDENCE")
+    hidden2 = torch.randn(2, 5, 16, requires_grad=True)
+    confidence2 = student._predict_dspark_confidence_logits(hidden2, prev_token_ids)
+    confidence2.sum().backward()
+    assert hidden2.grad is not None  # default: joint training (DeepSpec behavior)
+
+
 def test_dspark_prev_token_chain_matches_specforge_contract():
     student = _bare_student()
     input_ids = torch.tensor([[10, 11, 12, 13, 14, 15, 16, 17]], dtype=torch.long)
