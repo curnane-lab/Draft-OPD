@@ -607,6 +607,24 @@ def test_confidence_tv_target_mix_raises():
         distillation_loss(config, distillation_config, model_output, data)
 
 
+def test_entropy_surfaced_in_distillation_metrics():
+    config, distillation_config, model_output, data, *_ = _confidence_loss_inputs(1.0)
+    entropy = torch.tensor([0.7, 0.8, 0.9], dtype=torch.float32)
+    model_output["entropy"] = entropy
+    _, metrics = distillation_loss(config, distillation_config, model_output, data)
+    # opd_loss_mask drops the last flat position, so the response positions are
+    # flat indices 0 and 1 (same ones the base loss uses).
+    assert torch.allclose(
+        torch.as_tensor(metrics["distillation/entropy"].values[0]),
+        entropy[:2].mean(),
+    )
+
+    # absent from model_output -> no metric (flag off in production runs)
+    model_output.pop("entropy")
+    _, metrics_no_entropy = distillation_loss(config, distillation_config, model_output, data)
+    assert "distillation/entropy" not in metrics_no_entropy
+
+
 def test_confidence_stream_absent_is_noop_for_dflash():
     config, distillation_config, model_output, data, _, _, _ = _confidence_loss_inputs(1.0)
     for key in list(model_output):

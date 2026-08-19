@@ -649,6 +649,15 @@ def distillation_loss(
             effective_response_mask=effective_response_mask,
         )
     )
+    # Surface the composed student's draft entropy (computed when
+    # actor.calculate_entropy=True); a falling trend flags over-sharpening of
+    # the draft distribution.
+    entropy = model_output.get("entropy", None)
+    if entropy is not None:
+        entropy_padded = no_padding_2_padding(entropy, data)
+        distillation_metrics["distillation/entropy"] = Metric(
+            AggregationType.MEAN, _valid_mean(entropy_padded, effective_response_mask)
+        )
     if loss_config.loss_max_clamp is not None:
         clamp_fraction = _compute_loss_clamp_fraction(
             distillation_losses, effective_response_mask, loss_config.loss_max_clamp
