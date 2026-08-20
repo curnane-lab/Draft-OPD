@@ -774,7 +774,12 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
             labels = token_ids[start:end].to(device=log_probs.device)
             log_prob_chunks.append(log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1))
             if calculate_entropy:
-                entropy_chunks.append(-(log_probs.exp() * log_probs).sum(dim=-1))
+                # Entropy is a monitoring-only metric (never enters the loss):
+                # keep its fp32 vocab-space intermediates out of the autograd
+                # graph, otherwise every chunk's exp() output is retained for
+                # backward and tips the co-located NPU memory budget over.
+                with torch.no_grad():
+                    entropy_chunks.append(-(log_probs.exp() * log_probs).sum(dim=-1))
 
         selected_log_probs = torch.cat(log_prob_chunks, dim=0)
         selected_entropy = torch.cat(entropy_chunks, dim=0) if calculate_entropy else None

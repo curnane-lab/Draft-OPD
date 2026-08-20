@@ -299,6 +299,29 @@ def test_confidence_hidden_detached_under_env(monkeypatch):
     assert hidden2.grad is not None  # default: joint training (DeepSpec behavior)
 
 
+def test_entropy_is_grad_free_but_log_probs_keep_graph():
+    student = _bare_student()
+    hidden = torch.randn(10, 8)
+    draft_hidden = torch.nn.Parameter(hidden.unsqueeze(0))  # [batch=1, positions=10, H=8]
+    output_embeddings = torch.nn.Linear(8, 20, bias=False)
+    batch_indices = torch.zeros(5, dtype=torch.long)
+    draft_indices = torch.tensor([0, 2, 4, 6, 8])
+    token_ids = torch.randint(0, 20, (5,))
+    log_probs, entropy = student._compute_selected_lm_log_probs(
+        draft_hidden=draft_hidden,
+        output_embeddings=output_embeddings,
+        batch_indices=batch_indices,
+        draft_indices=draft_indices,
+        token_ids=token_ids,
+        chunk_size=2,
+        calculate_entropy=True,
+    )
+    assert log_probs.grad_fn is not None  # loss path keeps the graph
+    assert entropy is not None and entropy.grad_fn is None  # metric path is graph-free
+    log_probs.sum().backward()  # backward must not trip over the detached metric
+    assert draft_hidden.grad is not None
+
+
 def test_dspark_prev_token_chain_matches_specforge_contract():
     student = _bare_student()
     input_ids = torch.tensor([[10, 11, 12, 13, 14, 15, 16, 17]], dtype=torch.long)
