@@ -47,6 +47,7 @@ DFLASH_REJECTED_DRAFT_TEACHER_LOGPROBS = "dflash_rejected_draft_teacher_logprobs
 
 # Engine-side metadata dict keys produced by the vLLM(-Ascend) patch.
 META_REJECTED_ANCHOR_INDICES = "rejected_draft_anchor_indices"
+META_REJECTED_TOKEN_INDICES = "rejected_draft_token_indices"
 META_REJECTED_OFFSETS = "rejected_draft_offsets"
 META_REJECTED_TOKEN_IDS = "rejected_draft_token_ids"
 META_REJECTED_TEACHER_LOGPROBS = "rejected_draft_teacher_logprobs"
@@ -102,6 +103,10 @@ def build_dflash_extra_fields(metadata: Optional[dict[str, Any]], response_len: 
             patch is not active / the request has no metadata. Expected keys::
 
                 rejected_draft_anchor_indices: list[int]
+                    response positions (0-based) of the *block anchors* that
+                    produced each rejected draft proposal (used to anchor the
+                    training-side replay block).
+                rejected_draft_token_indices: list[int]
                     response positions (0-based) where a draft token was
                     rejected and replaced by the target token.
                 rejected_draft_offsets: list[int]
@@ -123,29 +128,31 @@ def build_dflash_extra_fields(metadata: Optional[dict[str, Any]], response_len: 
         return {}
 
     anchor_indices = [int(pos) for pos in metadata.get(META_REJECTED_ANCHOR_INDICES, [])]
+    reject_positions = [int(pos) for pos in metadata.get(META_REJECTED_TOKEN_INDICES, [])]
     offsets = [int(off) for off in metadata.get(META_REJECTED_OFFSETS, [])]
     token_ids = [int(tid) for tid in metadata.get(META_REJECTED_TOKEN_IDS, [])]
     teacher_logprobs = [float(lp) for lp in metadata.get(META_REJECTED_TEACHER_LOGPROBS, [])]
 
-    if not (len(anchor_indices) == len(offsets) == len(token_ids) == len(teacher_logprobs)):
+    if not (len(anchor_indices) == len(reject_positions) == len(offsets) == len(token_ids) == len(teacher_logprobs)):
         raise ValueError(
             "Inconsistent DFLASH reject metadata lengths: "
-            f"anchors={len(anchor_indices)}, offsets={len(offsets)}, "
+            f"anchors={len(anchor_indices)}, reject_positions={len(reject_positions)}, offsets={len(offsets)}, "
             f"token_ids={len(token_ids)}, teacher_logprobs={len(teacher_logprobs)}"
         )
 
-    # Keep only anchors that fall inside the produced response. The final
+    # Keep only rejections that fall inside the produced response. The final
     # verify step may reject draft tokens beyond the emitted response (e.g.
     # when generation stops on EOS/length), which cannot be supervised.
-    in_range = [i for i, pos in enumerate(anchor_indices) if 0 <= pos < response_len]
-    if len(in_range) != len(anchor_indices):
+    in_range = [i for i, pos in enumerate(reject_positions) if 0 <= pos < response_len]
+    if len(in_range) != len(reject_positions):
         anchor_indices = [anchor_indices[i] for i in in_range]
+        reject_positions = [reject_positions[i] for i in in_range]
         offsets = [offsets[i] for i in in_range]
         token_ids = [token_ids[i] for i in in_range]
         teacher_logprobs = [teacher_logprobs[i] for i in in_range]
 
     extra_fields: dict[str, Any] = {
-        DFLASH_REJECT_TOKEN_INDICES: anchor_indices,
+        DFLASH_REJECT_TOKEN_INDICES: reject_positions,
         DFLASH_REJECTED_DRAFT_ANCHOR_INDICES: anchor_indices,
         DFLASH_REJECTED_DRAFT_OFFSETS: offsets,
         DFLASH_REJECTED_DRAFT_TOKEN_IDS: token_ids,
@@ -153,8 +160,8 @@ def build_dflash_extra_fields(metadata: Optional[dict[str, Any]], response_len: 
     }
 
     # Debug/monitoring counters, mirroring the SGLang rollout path.
-    extra_fields["dflash_reject_token_count"] = len(anchor_indices)
-    extra_fields["dflash_non_reject_token_count"] = max(response_len - len(anchor_indices), 0)
+    extra_fields["dflash_reject_token_count"] = len(reject_positions)
+    extra_fields["dflash_non_reject_token_count"] = max(response_len - len(reject_positions), 0)
     extra_fields["dflash_empty_reject_token_indices"] = int(response_len > 0 and len(anchor_indices) == 0)
     num_verify_steps = int(metadata.get("_num_verify_steps", 0) or 0)
     # Mean tokens advanced per verify step (accepted prefix + bonus token),

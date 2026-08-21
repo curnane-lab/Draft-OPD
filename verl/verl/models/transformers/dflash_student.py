@@ -335,6 +335,23 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
             return variant
         return "dspark" if self._has_dspark_draft_markers() else "dflash"
 
+    def _is_dspark_next_token_layout(self) -> bool:
+        """Whether the draft uses the DSpark anchor-as-first-prediction layout.
+
+        Official DSpark checkpoints (e.g. deepseek-ai/dspark_qwen3_4b_block7)
+        run the ``sample_from_anchor`` path: every block slot predicts the
+        *next* token (slot j -> anchor + j + 1), including the anchor slot
+        (slot 0 -> anchor + 1). Speculators-format checkpoints set
+        ``dspark_bonus_anchor=True`` and instead use the DFlash ``1 + N``
+        fill-in layout (slot j -> anchor + j, anchor is a bonus token), which
+        this student already implements. Only the former needs the shifted
+        next-token mapping; the bonus-anchor variant must keep fill-in.
+        """
+        if self._get_draft_variant() != "dspark":
+            return False
+        draft_config = getattr(self.draft_model, "config", None)
+        return not bool(getattr(draft_config, "dspark_bonus_anchor", False))
+
     def _init_dspark_fallback_heads(self) -> None:
         """Create student-side DSpark heads when the draft remote code lacks them.
 
@@ -648,22 +665,21 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         block_keep_mask: torch.Tensor,
         block_size: int,
     ) -> torch.Tensor:
-        """Prev-token chain for the DSpark Markov bias, aligned with SpecForge.
+        """Prev-token chain for the DSpark Markov bias.
 
-        Draft position j of a block predicts the token at anchor + j, and its
-        Markov bias is driven by the previous token in the chain, i.e. the token
-        at anchor + j - 1 (the anchor token itself for j = 1). For a rejected
-        draft position (j == rejected offset) this is exactly the last accepted
-        token. Everything comes from the recorded response, so no engine-side
-        data is needed. This matches SpecForge's
-        ``prev_token_ids = cat([anchor_token, target_ids[:, :, :-1]])`` with the
-        SpecForge block position k mapping to draft position k + 1 here (the
-        DFlash block includes the anchor position, SpecForge's does not).
+        DFlash fill-in layout: draft slot j predicts the token at anchor + j,
+        so its bias is driven by the token at anchor + j - 1 (the anchor token
+        itself for j = 1). DSpark next-token (sample_from_anchor) layout: slot
+        j predicts anchor + j + 1, so its bias is driven by the token at
+        anchor + j (the anchor token itself for j = 0). Everything comes from
+        the recorded response, so no engine-side data is needed.
         """
         batch_size, seq_len = input_ids.shape
         num_blocks = anchor_positions.shape[1]
         device = input_ids.device
-        offsets = torch.arange(block_size, device=device).view(1, 1, -1) - 1
+        offsets = torch.arange(block_size, device=device).view(1, 1, -1)
+        if not self._is_dspark_next_token_layout():
+            offsets = offsets - 1
         prev_positions = (anchor_positions.unsqueeze(-1) + offsets).clamp(0, seq_len - 1)
         prev_token_ids = torch.gather(
             input_ids.unsqueeze(1).expand(batch_size, num_blocks, seq_len), 2, prev_positions
@@ -918,7 +934,11 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                 segment_len = boundary_resp - anchor_resp
                 if segment_len <= 0:
                     continue
-                segment_len = min(segment_len, draft_block_size - 1)
+                # DFlash fill-in supervises at most B-1 positions per block
+                # (slots 1..B-1); DSpark next-token supervises all B slots
+                # (slot j -> anchor + j + 1), so the cap is one larger.
+                max_segment_len = draft_block_size if self._is_dspark_next_token_layout() else draft_block_size - 1
+                segment_len = min(segment_len, max_segment_len)
                 if full_anchor < 0 or full_anchor >= seq_len - 1:
                     continue
                 response_anchors_resp.append(anchor_resp)
@@ -959,7 +979,10 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                     if not bool(rejected_draft_mask[batch_idx, item_idx].item()):
                         continue
                     offset = int(rejected_draft_offsets[batch_idx, item_idx].item())
-                    if offset <= 0 or offset >= draft_block_size:
+                    # DSpark next-token rejects may land on the last slot
+                    # (offset == draft_block_size); DFlash fill-in caps at B-1.
+                    max_offset = draft_block_size if self._is_dspark_next_token_layout() else draft_block_size - 1
+                    if offset <= 0 or offset > max_offset:
                         continue
                     anchor_resp = int(rejected_draft_anchor_indices[batch_idx, item_idx].item())
                     full_anchor = prompt_len - 1 if anchor_resp < 0 else prompt_len + anchor_resp
@@ -1051,7 +1074,10 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                     continue
                 offset = int(rejected_draft_offsets[batch_idx, item_idx].item())
                 token_id = int(rejected_draft_token_ids[batch_idx, item_idx].item())
-                if offset <= 0 or offset >= draft_block_size or token_id < 0:
+                # DSpark next-token rejects may land on the last slot (offset ==
+                # draft_block_size); DFlash fill-in caps at B-1.
+                max_offset = draft_block_size if self._is_dspark_next_token_layout() else draft_block_size - 1
+                if offset <= 0 or offset > max_offset or token_id < 0:
                     continue
                 anchor_resp = int(rejected_draft_anchor_indices[batch_idx, item_idx].item())
                 full_anchor = prompt_len - 1 if anchor_resp < 0 else prompt_len + anchor_resp
@@ -1129,8 +1155,14 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                     continue
                 offset = int(rejected_draft_offsets[batch_idx, item_idx].item())
                 token_id = int(rejected_draft_token_ids[batch_idx, item_idx].item())
-                if offset <= 0 or offset >= draft_block_size or token_id < 0:
+                # DFlash fill-in: rejected proposal lives at slot `offset`
+                # (1..B-1). DSpark next-token: it lives at slot `offset - 1`
+                # (0..B-1), and a last-slot rejection has offset == B.
+                next_token_layout = self._is_dspark_next_token_layout()
+                max_offset = draft_block_size if next_token_layout else draft_block_size - 1
+                if offset <= 0 or offset > max_offset or token_id < 0:
                     continue
+                q_index = offset - 1 if next_token_layout else offset
                 anchor_resp = int(rejected_draft_anchor_indices[batch_idx, item_idx].item())
                 full_anchor = prompt_len - 1 if anchor_resp < 0 else prompt_len + anchor_resp
                 if full_anchor < 0 or full_anchor >= valid_len:
@@ -1140,7 +1172,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                     continue
                 block_idx = int(torch.nonzero(block_matches, as_tuple=False)[0, 0].item())
                 selected_batch_indices.append(batch_idx)
-                selected_draft_indices.append(block_idx * draft_block_size + offset)
+                selected_draft_indices.append(block_idx * draft_block_size + q_index)
                 selected_token_ids.append(token_id)
                 selected_item_indices.append((batch_idx, item_idx))
                 selected_counts[batch_idx] += 1
@@ -1230,7 +1262,9 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                 if max_tokens_per_sample is not None and selected_counts[batch_idx] >= max_tokens_per_sample:
                     continue
                 offset = int(rejected_draft_offsets[batch_idx, item_idx].item())
-                if offset <= 0 or offset >= draft_block_size:
+                next_token_layout = self._is_dspark_next_token_layout()
+                max_offset = draft_block_size if next_token_layout else draft_block_size - 1
+                if offset <= 0 or offset > max_offset:
                     continue
                 anchor_resp = int(rejected_draft_anchor_indices[batch_idx, item_idx].item())
                 full_anchor = prompt_len - 1 if anchor_resp < 0 else prompt_len + anchor_resp
@@ -1241,12 +1275,18 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                     continue
                 block_idx = int(torch.nonzero(block_matches, as_tuple=False)[0, 0].item())
                 selected_counts[batch_idx] += 1
-                for draft_offset in range(1, offset + 1):
+                # DFlash fill-in: slots 1..offset-1 accepted (1), slot offset
+                # rejected (0). DSpark next-token: slots 0..offset-2 accepted,
+                # slot offset-1 rejected (slot 0 is now a labeled position).
+                slot_start, slot_end, reject_slot = (
+                    (0, offset, offset - 1) if next_token_layout else (1, offset + 1, offset)
+                )
+                for draft_offset in range(slot_start, slot_end):
                     flat_draft_idx = block_idx * draft_block_size + draft_offset
                     selected_batch_indices.append(batch_idx)
                     selected_draft_indices.append(flat_draft_idx)
                     selected_slots.append((batch_idx, item_idx, draft_offset))
-                    selected_labels.append(0.0 if draft_offset == offset else 1.0)
+                    selected_labels.append(0.0 if draft_offset == reject_slot else 1.0)
                     if markov_prev_token_ids is not None:
                         selected_prev_token_ids.append(int(markov_prev_token_ids[batch_idx, flat_draft_idx].item()))
 
@@ -1582,14 +1622,21 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
             response_draft_indices: list[torch.Tensor] = []
             response_row_indices: list[torch.Tensor] = []
             response_labels: list[torch.Tensor] = []
-            for block_offset in range(1, draft_block_size):
-                active_blocks = block_keep_mask & (segment_lens >= block_offset)
+            next_token_layout = self._is_dspark_next_token_layout()
+            # DFlash fill-in: slot j (j>=1) predicts anchor + j, stored at row
+            # anchor + j - 1. DSpark next-token: slot j (j>=0) predicts
+            # anchor + j + 1, stored at row anchor + j.
+            first_offset = 0 if next_token_layout else 1
+            for block_offset in range(first_offset, draft_block_size):
+                row_delta = block_offset if next_token_layout else block_offset - 1
+                need_segment_len = block_offset + 1 if next_token_layout else block_offset
+                active_blocks = block_keep_mask & (segment_lens >= need_segment_len)
                 if not bool(active_blocks.any()):
                     continue
                 block_indices = torch.nonzero(active_blocks, as_tuple=False)
                 batch_indices = block_indices[:, 0]
                 anchor_block_indices = block_indices[:, 1]
-                row_indices = row_starts[batch_indices, anchor_block_indices] + (block_offset - 1)
+                row_indices = row_starts[batch_indices, anchor_block_indices] + row_delta
                 label_indices = row_indices + 1
                 in_bounds = label_indices < valid_seq_lens[batch_indices]
                 if not bool(in_bounds.any()):

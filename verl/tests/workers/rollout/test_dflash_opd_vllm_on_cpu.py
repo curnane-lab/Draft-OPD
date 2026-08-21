@@ -157,10 +157,13 @@ def test_registry_pop_replays_response_positions():
     metadata = registry.pop("req-1")
     assert metadata is not None
     # Response starts with the prefill token at position 0.
-    # step1: positions 1,2 accepted; rejection at 3; recovered token at 3.
-    # step2: positions 4-7 accepted; bonus at 8.
-    # step3: rejection at 9.
-    assert metadata["rejected_draft_anchor_indices"] == [3, 9]
+    # step1: block anchored at 0, positions 1,2 accepted; rejection at 3.
+    # step2: block anchored at 3, positions 4-7 accepted; bonus at 8.
+    # step3: block anchored at 8, immediate rejection at 9.
+    # anchor_indices hold the *block anchors*; token_indices the *rejection
+    # positions*.
+    assert metadata["rejected_draft_anchor_indices"] == [0, 8]
+    assert metadata["rejected_draft_token_indices"] == [3, 9]
     assert metadata["rejected_draft_offsets"] == [3, 1]
     assert metadata["rejected_draft_token_ids"] == [111, 222]
     assert metadata["rejected_draft_teacher_logprobs"] == [-0.5, -1.5]
@@ -183,7 +186,8 @@ def test_registry_pop_matches_engine_suffixed_request_id():
 
     metadata = registry.pop(base)
     assert metadata is not None
-    assert metadata["rejected_draft_anchor_indices"] == [2]
+    assert metadata["rejected_draft_anchor_indices"] == [0]
+    assert metadata["rejected_draft_token_indices"] == [2]
     assert metadata["rejected_draft_token_ids"] == [1438]
     # Consumed.
     assert registry.pop(base) is None
@@ -205,14 +209,15 @@ def test_registry_pop_prefers_exact_key_over_suffix_match():
 
 def test_build_dflash_extra_fields_matches_sglang_contract():
     metadata = {
-        "rejected_draft_anchor_indices": [3, 9],
+        "rejected_draft_anchor_indices": [0, 8],
+        "rejected_draft_token_indices": [3, 9],
         "rejected_draft_offsets": [3, 1],
         "rejected_draft_token_ids": [111, 222],
         "rejected_draft_teacher_logprobs": [-0.5, -1.5],
     }
     fields = build_dflash_extra_fields(metadata, response_len=10)
     assert fields["dflash_reject_token_indices"] == [3, 9]
-    assert fields["dflash_rejected_draft_anchor_indices"] == [3, 9]
+    assert fields["dflash_rejected_draft_anchor_indices"] == [0, 8]
     assert fields["dflash_rejected_draft_offsets"] == [3, 1]
     assert fields["dflash_rejected_draft_token_ids"] == [111, 222]
     assert fields["dflash_rejected_draft_teacher_logprobs"] == [-0.5, -1.5]
@@ -223,13 +228,15 @@ def test_build_dflash_extra_fields_matches_sglang_contract():
 
 def test_build_dflash_extra_fields_drops_out_of_range_anchors():
     metadata = {
-        "rejected_draft_anchor_indices": [3, 12],
+        "rejected_draft_anchor_indices": [0, 8],
+        "rejected_draft_token_indices": [3, 12],
         "rejected_draft_offsets": [3, 1],
         "rejected_draft_token_ids": [111, 222],
         "rejected_draft_teacher_logprobs": [-0.5, -1.5],
     }
     fields = build_dflash_extra_fields(metadata, response_len=10)
     assert fields["dflash_reject_token_indices"] == [3]
+    assert fields["dflash_rejected_draft_anchor_indices"] == [0]
     assert fields["dflash_rejected_draft_token_ids"] == [111]
     assert fields["dflash_rejected_draft_teacher_logprobs"] == [-0.5]
 
@@ -238,6 +245,7 @@ def test_build_dflash_extra_fields_none_and_empty():
     assert build_dflash_extra_fields(None, response_len=10) == {}
     empty = {
         "rejected_draft_anchor_indices": [],
+        "rejected_draft_token_indices": [],
         "rejected_draft_offsets": [],
         "rejected_draft_token_ids": [],
         "rejected_draft_teacher_logprobs": [],
@@ -251,6 +259,7 @@ def test_build_dflash_extra_fields_none_and_empty():
 def test_build_dflash_extra_fields_length_mismatch_raises():
     bad = {
         "rejected_draft_anchor_indices": [3],
+        "rejected_draft_token_indices": [3],
         "rejected_draft_offsets": [3, 1],
         "rejected_draft_token_ids": [111],
         "rejected_draft_teacher_logprobs": [-0.5],

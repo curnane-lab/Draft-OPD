@@ -468,20 +468,21 @@ def _confidence_student(hidden_size=1):
 
 def test_dspark_confidence_labels_reject_at_last_draft_position():
     # offset = block_size - 1: every earlier draft position was accepted.
+    # next-token layout: slots 0..offset-2 accepted (1), slot offset-1 rejected (0).
     student, confidence_head = _confidence_student()
     block_size = 5
     draft_hidden = torch.arange(block_size, dtype=torch.float32).view(1, block_size, 1) + 1.0
 
     logits, labels, mask = _collect_confidence(student, draft_hidden, offsets=[4])
 
-    assert labels.tolist() == [[[0.0, 1.0, 1.0, 1.0, 0.0]]]
-    assert mask.tolist() == [[[False, True, True, True, True]]]
-    expected_logits = confidence_head(draft_hidden[0, 1:5]).squeeze(-1)
-    assert torch.allclose(logits[0, 0, 1:5], expected_logits)
+    assert labels.tolist() == [[[1.0, 1.0, 1.0, 0.0, 0.0]]]
+    assert mask.tolist() == [[[True, True, True, True, False]]]
+    expected_logits = confidence_head(draft_hidden[0, 0:4]).squeeze(-1)
+    assert torch.allclose(logits[0, 0, 0:4], expected_logits)
 
 
 def test_dspark_confidence_labels_first_position_rejection():
-    # offset = 1: only the first draft position is labeled, with 0.
+    # offset = 1: only the first draft position (slot 0) is labeled, with 0.
     student, confidence_head = _confidence_student()
     block_size = 5
     draft_hidden = torch.arange(block_size, dtype=torch.float32).view(1, block_size, 1) + 1.0
@@ -489,8 +490,8 @@ def test_dspark_confidence_labels_first_position_rejection():
     logits, labels, mask = _collect_confidence(student, draft_hidden, offsets=[1])
 
     assert labels.tolist() == [[[0.0, 0.0, 0.0, 0.0, 0.0]]]
-    assert mask.tolist() == [[[False, True, False, False, False]]]
-    assert torch.allclose(logits[0, 0, 1], confidence_head(draft_hidden[0, 1]).squeeze(-1))
+    assert mask.tolist() == [[[True, False, False, False, False]]]
+    assert torch.allclose(logits[0, 0, 0], confidence_head(draft_hidden[0, 0]).squeeze(-1))
 
 
 def test_dspark_confidence_labels_mid_block_rejection():
@@ -500,8 +501,22 @@ def test_dspark_confidence_labels_mid_block_rejection():
 
     _, labels, mask = _collect_confidence(student, draft_hidden, offsets=[3], block_size=block_size)
 
-    assert labels.tolist() == [[[0.0, 1.0, 1.0, 0.0, 0.0, 0.0]]]
-    assert mask.tolist() == [[[False, True, True, True, False, False]]]
+    assert labels.tolist() == [[[1.0, 1.0, 0.0, 0.0, 0.0, 0.0]]]
+    assert mask.tolist() == [[[True, True, True, False, False, False]]]
+
+
+def test_dspark_confidence_labels_last_slot_rejection_offset_equals_block_size():
+    # offset == block_size (num_accepted = B - 1): the last-slot rejection must
+    # not be dropped (A3). next-token: slots 0..B-2 accepted (1), slot B-1
+    # rejected (0).
+    student, _ = _confidence_student()
+    block_size = 5
+    draft_hidden = torch.zeros(1, block_size, 1)
+
+    _, labels, mask = _collect_confidence(student, draft_hidden, offsets=[5], block_size=block_size)
+
+    assert labels.tolist() == [[[1.0, 1.0, 1.0, 1.0, 0.0]]]
+    assert mask.tolist() == [[[True, True, True, True, True]]]
 
 
 def test_dspark_confidence_empty_metadata_returns_empty_stream():
@@ -735,11 +750,11 @@ def _tiny_opd_kwargs():
     }
 
 
-def _expected_logprob(student, prev_token_id, label_token_id):
-    mask_embed = student.main_model.embed_tokens(
-        torch.tensor([student.draft_model.mask_token_id], dtype=torch.long)
-    )
-    base_logits = student.main_model.lm_head(mask_embed)
+def _expected_logprob(student, prev_token_id, label_token_id, input_token_id=None):
+    if input_token_id is None:
+        input_token_id = student.draft_model.mask_token_id
+    input_embed = student.main_model.embed_tokens(torch.tensor([input_token_id], dtype=torch.long))
+    base_logits = student.main_model.lm_head(input_embed)
     bias = student.draft_model.markov_head.compute_step_bias(torch.tensor([prev_token_id], dtype=torch.long))
     return torch.log_softmax((base_logits + bias).float(), dim=-1)[0, label_token_id]
 
@@ -750,13 +765,17 @@ def test_forward_opd_dspark_end_to_end_markov_and_confidence():
 
     assert int(output["dflash_opd_draft_variant_id"].item()) == 1
 
-    # Response stream, block anchored at seq position 2: draft position 1
-    # predicts token 4 with prev token 3, and its logprob is stored at row 2.
-    assert torch.allclose(output["dflash_log_probs"][0, 2], _expected_logprob(student, 3, 4))
-    # Draft position 2 of the same block: prev token is the accepted token 4.
+    # Response stream (DSpark next-token): the first block anchors at the last
+    # prompt token (seq position 2) and every slot predicts the *next* token.
+    # slot 0 (anchor token 3) predicts token 4 with markov driver = anchor (3),
+    # stored at row 2; the anchor slot uses the anchor token's embedding.
+    assert torch.allclose(output["dflash_log_probs"][0, 2], _expected_logprob(student, 3, 4, input_token_id=3))
+    # slot 1 (mask at seq 3) predicts token 5 with driver = accepted token 4.
     assert torch.allclose(output["dflash_log_probs"][0, 3], _expected_logprob(student, 4, 5))
-    # Rejected draft token 9 at offset 2 of the block anchored at seq position 3:
-    # prev token is the last accepted token 5.
+    # slot 2 (mask at seq 4) predicts token 6 with driver = accepted token 5.
+    assert torch.allclose(output["dflash_log_probs"][0, 4], _expected_logprob(student, 5, 6))
+    # Rejected draft token 9: q_index = offset - 1 = 1 (mask at seq 4) of the
+    # block anchored at seq position 3; markov driver = last accepted token 5.
     assert torch.allclose(
         output["dflash_rejected_draft_student_log_probs"][0, 0],
         _expected_logprob(student, 5, 9),
@@ -767,13 +786,17 @@ def test_forward_opd_dspark_end_to_end_markov_and_confidence():
     )
     assert output["dflash_rejected_draft_loss_mask"].tolist() == [[True]]
 
-    # Confidence stream: offset=2 -> slot 1 accepted (1), slot 2 rejected (0).
-    assert output["dflash_dspark_confidence_labels"].tolist() == [[[0.0, 1.0, 0.0, 0.0]]]
-    assert output["dflash_dspark_confidence_mask"].tolist() == [[[False, True, True, False]]]
+    # Confidence stream (next-token): offset=2 -> slot 0 accepted (1), slot 1
+    # rejected (0); slot 0 is now a labeled position.
+    assert output["dflash_dspark_confidence_labels"].tolist() == [[[1.0, 0.0, 0.0, 0.0]]]
+    assert output["dflash_dspark_confidence_mask"].tolist() == [[[True, True, False, False]]]
+    expected_conf_slot0 = student.draft_model.confidence_head(
+        student.main_model.embed_tokens(torch.tensor([4], dtype=torch.long))
+    ).squeeze(-1).float()
     mask_embed = student.main_model.embed_tokens(torch.tensor([15], dtype=torch.long))
-    expected_confidence = student.draft_model.confidence_head(mask_embed).squeeze(-1).float()
-    assert torch.allclose(output["dflash_dspark_confidence_logits"][0, 0, 1], expected_confidence[0])
-    assert torch.allclose(output["dflash_dspark_confidence_logits"][0, 0, 2], expected_confidence[0])
+    expected_conf_slot1 = student.draft_model.confidence_head(mask_embed).squeeze(-1).float()
+    assert torch.allclose(output["dflash_dspark_confidence_logits"][0, 0, 0], expected_conf_slot0[0])
+    assert torch.allclose(output["dflash_dspark_confidence_logits"][0, 0, 1], expected_conf_slot1[0])
     assert int(output["dflash_opd_dspark_confidence_token_count"].item()) == 2
 
 

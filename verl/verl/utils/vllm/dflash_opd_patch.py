@@ -160,6 +160,7 @@ class DFlashOpdMetadataRegistry:
             return None
 
         anchor_indices: list[int] = []
+        reject_positions: list[int] = []
         offsets: list[int] = []
         token_ids: list[int] = []
         teacher_logprobs: list[float] = []
@@ -168,9 +169,15 @@ class DFlashOpdMetadataRegistry:
         # with the prefill token at position 0.
         pos = 1
         for num_accepted, _num_draft, rejected_token_id, teacher_logprob in events:
+            # At each step start, pos points at this block's first proposal, so
+            # the block's anchor sits at pos - 1. Record the block anchor (used
+            # by the training-side replay) separately from the rejection
+            # position (where the target replaced the draft token).
+            block_anchor = pos - 1
             pos += num_accepted
             if rejected_token_id >= 0:
-                anchor_indices.append(pos)
+                anchor_indices.append(block_anchor)
+                reject_positions.append(pos)
                 offsets.append(num_accepted + 1)
                 token_ids.append(rejected_token_id)
                 teacher_logprobs.append(teacher_logprob)
@@ -178,6 +185,7 @@ class DFlashOpdMetadataRegistry:
 
         return {
             "rejected_draft_anchor_indices": anchor_indices,
+            "rejected_draft_token_indices": reject_positions,
             "rejected_draft_offsets": offsets,
             "rejected_draft_token_ids": token_ids,
             "rejected_draft_teacher_logprobs": teacher_logprobs,

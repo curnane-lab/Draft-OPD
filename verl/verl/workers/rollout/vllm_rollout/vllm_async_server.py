@@ -345,7 +345,7 @@ class vLLMHttpServer:
         # propagate to this server process. Must happen before the engine
         # (and its workers) are spawned so they inherit the env flag.
         _spec_cfg = args.get("speculative_config") or {}
-        if self.is_composed_dflash_student or _spec_cfg.get("method") == "dflash":
+        if self.is_composed_dflash_student or _spec_cfg.get("method") in ("dflash", "dspark"):
             os.environ["VERL_DFLASH_OPD"] = "1"
         logger.info(
             "DFLASH OPD rollout: composed_student=%s, speculative_config=%s, VERL_DFLASH_OPD=%s",
